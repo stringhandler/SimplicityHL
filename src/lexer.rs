@@ -17,6 +17,8 @@ pub enum Token<'src> {
     Mod,
     Const,
     Match,
+    If,
+    Else,
 
     // Control symbols
     Arrow,
@@ -69,6 +71,8 @@ impl<'src> fmt::Display for Token<'src> {
             Token::Mod => write!(f, "mod"),
             Token::Const => write!(f, "const"),
             Token::Match => write!(f, "match"),
+            Token::If => write!(f, "if"),
+            Token::Else => write!(f, "else"),
 
             Token::Arrow => write!(f, "->"),
             Token::Colon => write!(f, ":"),
@@ -140,6 +144,8 @@ pub fn lexer<'src>(
         "mod" => Token::Mod,
         "const" => Token::Const,
         "match" => Token::Match,
+        "if" => Token::If,
+        "else" => Token::Else, // TODO: Else is never parsed.
         "true" => Token::Bool(true),
         "false" => Token::Bool(false),
         _ => Token::Ident(s),
@@ -249,6 +255,31 @@ mod tests {
         let (tokens, errors) = lexer().parse(input).into_output_errors();
         let tokens = tokens.map(|vec| vec.iter().map(|(tok, _)| tok.clone()).collect::<Vec<_>>());
         (tokens, errors)
+    }
+
+    #[test]
+    fn test_if_statement() {
+        let input = "if true {0} else {1};";
+        let (tokens, errors) = lex(input);
+        assert!(errors.is_empty(), "Expected no errors, found: {:?}", errors);
+
+        assert_eq!(
+            tokens,
+            Some(vec![
+                Token::If,
+                Token::Bool(true,),
+                Token::LBrace,
+                Token::DecLiteral(Decimal(Arc::new("0"))),
+                Token::RBrace,
+                Token::Else,
+                Token::LBrace,
+                Token::DecLiteral(Decimal(Arc::new("1"))),
+                Token::RBrace,
+                Token::Semi,
+            ])
+        );
+        dbg!(tokens);
+        todo!("Finish");
     }
 
     #[test]
