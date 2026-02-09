@@ -1642,6 +1642,8 @@ impl SingleExpression {
 
         let match_expr = Match::parser(expr.clone()).map(SingleExpressionInner::Match);
 
+        let if_expr = If::parser(expr.clone()).map(SingleExpressionInner::If);
+
         let variable = Identifier::parser().map(SingleExpressionInner::Variable);
 
         // Expression delimeted by parentheses
@@ -1651,8 +1653,8 @@ impl SingleExpression {
             .map(|es| SingleExpressionInner::Expression(Arc::from(es)));
 
         choice((
-            left, right, some, none, boolean, match_expr, expression, list, array, tuple, call,
-            literal, variable,
+            left, right, some, none, boolean, match_expr, if_expr, expression, list, array, tuple,
+            call, literal, variable,
         ))
         .map_with(|inner, e| Self {
             inner,
@@ -1812,6 +1814,35 @@ impl Match {
                         span: e.span(),
                     }
                 }
+            })
+    }
+}
+
+impl If {
+    fn parser<'tokens, 'src: 'tokens, I, E>(
+        expr: E,
+    ) -> impl Parser<'tokens, I, Self, ParseError<'src>> + Clone
+    where
+        I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+        E: Parser<'tokens, I, Expression, ParseError<'src>> + Clone + 'tokens,
+    {
+        let scrutinee = expr.clone().map(Arc::new);
+
+        let true_arm = expr.clone().map(Arc::new);
+        let false_arm = expr.clone().map(Arc::new);
+        // let true_arm = delimited_with_recovery(Expression::parser, Token::LBrace, Token::RBrace, |_| None);
+        // let false_arm = delimited_with_recovery(Expression::parser, Token::LBrace, Token::RBrace, |_| None);
+
+        just(Token::If)
+            .ignore_then(scrutinee)
+            .then(true_arm)
+            .then_ignore(just(Token::Else))
+            .then(false_arm)
+            .map_with(|((s, t), el), extra| Self {
+                scrutinee: s,
+                then_arm: t,
+                else_arm: el,
+                span: extra.span(),
             })
     }
 }
@@ -2210,5 +2241,29 @@ impl crate::ArbitraryRec for Match {
             },
             span: Span::DUMMY,
         })
+    }
+}
+
+#[cfg(test)]
+mod test {
+
+    use super::*;
+    #[test]
+    fn test_if_statement_parse() {
+        // let input: Arc<str> = "if true {0} else {1};".into();
+        let input = "if true {0} else {1}";
+
+        let statement = Expression::parse_from_str(input).expect("Error");
+
+        match &statement.inner() {
+            ExpressionInner::Single(se) => match se.inner() {
+                SingleExpressionInner::If(if_) => {
+                    dbg!(if_);
+                    // pass
+                }
+                _ => panic!("Did not find if statement correctly"),
+            },
+            _ => panic!("Did not parse correctly"),
+        }
     }
 }
