@@ -423,6 +423,9 @@ impl Call {
                 let iden = ProgNode::iden(scope.ctx());
                 scope.with_debug_symbol(args, &iden, self)
             }
+            CallName::Padding => {
+                todo!("Fix compile");
+            }
             CallName::TypeCast(..) => {
                 // A cast converts between two structurally equal types.
                 // Structural equality of SimplicityHL types A and B means

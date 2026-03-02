@@ -216,6 +216,8 @@ pub enum CallName {
     ArrayFold(FunctionName, NonZeroUsize),
     /// Loop over the given function a bounded number of times until it returns success.
     ForWhile(FunctionName),
+    /// Padding to add to the transaction to increase the weight of the transaction to fit CPU heavy programs
+    Padding,
 }
 
 /// A type alias.
@@ -819,6 +821,7 @@ impl fmt::Display for CallName {
             CallName::Fold(name, bound) => write!(f, "fold::<{name}, {bound}>"),
             CallName::ArrayFold(name, size) => write!(f, "array_fold::<{name}, {size}>"),
             CallName::ForWhile(name) => write!(f, "for_while::<{name}>"),
+            CallName::Padding => write!(f, "padding!"),
         }
     }
 }
@@ -1435,6 +1438,7 @@ impl ChumskyParse for CallName {
             Token::Macro("assert!") => CallName::Assert,
             Token::Macro("panic!") => CallName::Panic,
             Token::Macro("dbg!") => CallName::Debug,
+            Token::Macro("padding!") => CallName::Padding,
         };
 
         let jet = select! { Token::Jet(s) => JetName::from_str_unchecked(s) }.map(CallName::Jet);
@@ -2161,5 +2165,33 @@ impl crate::ArbitraryRec for Match {
             },
             span: Span::DUMMY,
         })
+    }
+}
+
+#[cfg(test)]
+mod test {
+
+    use super::*;
+
+    #[test]
+    fn test_parse_padding() {
+        let input = "padding!(10)";
+
+        let statement = Expression::parse_from_str(input).expect("Error");
+
+        match &statement.inner() {
+            ExpressionInner::Single(se) => match se.inner() {
+                SingleExpressionInner::Call(call) => match call.name() {
+                    CallName::Padding => {}
+                    _ => {
+                        panic!("Did not parse as a padding call")
+                    }
+                },
+                _ => {
+                    panic!("Did not find padding statement correctly")
+                }
+            },
+            _ => panic!("Did not parse correctly"),
+        }
     }
 }

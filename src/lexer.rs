@@ -130,8 +130,14 @@ pub fn lexer<'src>(
         .ignore_then(digits_with_underscore(2))
         .map(|s: &str| Token::BinLiteral(Binary::from_str_unchecked(s.replace('_', "").as_str())));
 
-    let macros =
-        choice((just("assert!"), just("panic!"), just("dbg!"), just("list!"))).map(Token::Macro);
+    let macros = choice((
+        just("assert!"),
+        just("panic!"),
+        just("dbg!"),
+        just("list!"),
+        just("padding!"),
+    ))
+    .map(Token::Macro);
 
     let keyword = text::ident().map(|s| match s {
         "fn" => Token::Fn,
@@ -343,5 +349,21 @@ mod tests {
         let _ = tokens.unwrap();
 
         assert!(lex_errs.is_empty());
+    }
+
+    #[test]
+    fn test_lexer_padding_detection() {
+        let expr = "padding!(10);";
+
+        let (tokens, lex_errs) = lexer().parse(expr).into_output_errors();
+
+        let _ = tokens.unwrap();
+
+        assert!(lex_errs.is_empty());
+
+        // TODO: uncomment when if PR is merged.
+        // assert_tokens_match!(
+        //     tokens, If, Bool, LBrace, DecLiteral, RBrace, Else, LBrace, DecLiteral, RBrace, Semi,
+        // );
     }
 }
