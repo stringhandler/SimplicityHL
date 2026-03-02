@@ -288,6 +288,20 @@ impl Expression {
             span,
         }
     }
+
+    pub fn is_single(&self) -> bool {
+        match &self.inner {
+            ExpressionInner::Block(..) => false,
+            ExpressionInner::Single(..) => true,
+        }
+    }
+
+    pub fn is_block(&self) -> bool {
+        match &self.inner {
+            ExpressionInner::Block(..) => true,
+            ExpressionInner::Single(..) => false,
+        }
+    }
 }
 
 impl_eq_hash!(Expression; inner);
@@ -1828,29 +1842,30 @@ impl If {
     {
         let scrutinee = expr.clone().map(Arc::new);
 
-        let true_arm = delimited_with_recovery(
-            expr.clone().map(Arc::new),
-            Token::LBrace,
-            Token::RBrace,
-            |span| Arc::new(Expression::empty(span)),
-        );
-        let false_arm = delimited_with_recovery(
-            expr.clone().map(Arc::new),
-            Token::LBrace,
-            Token::RBrace,
-            |span| Arc::new(Expression::empty(span)),
-        );
+        let true_arm = expr.clone().map(Arc::new);
+        let false_arm = expr.clone().map(Arc::new);
 
         just(Token::If)
             .ignore_then(scrutinee)
             .then(true_arm)
             .then_ignore(just(Token::Else))
             .then(false_arm)
-            .map_with(|((s, t), el), extra| Self {
-                scrutinee: s,
-                then_arm: t,
-                else_arm: el,
-                span: extra.span(),
+            .validate(|((scrutinee, then), else_), extra, emit| {
+                // Do not allow single statements, only blocks. I.E. `then` and `else` arms must be
+                // wrapped in braces.
+                if !then.is_block() {
+                    emit.emit(Error::IfThenArmMissingBraces.with_span(extra.span()));
+                }
+                if !else_.is_block() {
+                    emit.emit(Error::IfElseArmMissingBraces.with_span(extra.span()))
+                }
+
+                Self {
+                    scrutinee,
+                    then_arm: then,
+                    else_arm: else_,
+                    span: extra.span(),
+                }
             })
     }
 }
