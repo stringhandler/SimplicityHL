@@ -1828,8 +1828,18 @@ impl If {
     {
         let scrutinee = expr.clone().map(Arc::new);
 
-        let true_arm = expr.clone().map(Arc::new);
-        let false_arm = expr.clone().map(Arc::new);
+        let true_arm = delimited_with_recovery(
+            expr.clone().map(Arc::new),
+            Token::LBrace,
+            Token::RBrace,
+            |span| Arc::new(Expression::empty(span)),
+        );
+        let false_arm = delimited_with_recovery(
+            expr.clone().map(Arc::new),
+            Token::LBrace,
+            Token::RBrace,
+            |span| Arc::new(Expression::empty(span)),
+        );
 
         just(Token::If)
             .ignore_then(scrutinee)
@@ -2261,5 +2271,19 @@ mod test {
             },
             _ => panic!("Did not parse correctly"),
         }
+    }
+
+    #[test]
+    fn test_if_statement_requires_braces() {
+        // `else` branch without braces should fail to parse
+        assert!(
+            Expression::parse_from_str("if true { x } else y").is_err(),
+            "if-else without braces on else branch should fail"
+        );
+        // `if` branch without braces should also fail
+        assert!(
+            Expression::parse_from_str("if true x else { y }").is_err(),
+            "if without braces on if branch should fail"
+        );
     }
 }
