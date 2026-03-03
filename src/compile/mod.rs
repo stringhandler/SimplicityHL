@@ -423,10 +423,23 @@ impl Call {
                 let iden = ProgNode::iden(scope.ctx());
                 scope.with_debug_symbol(args, &iden, self)
             }
-            CallName::Padding(_size) => {
-                // let num_bytes = args.
-
-                todo!("Fix compile");
+            CallName::Padding(size) => {
+                fn recurse_padding<'x>(
+                    index: usize,
+                    scope: &mut Scope<'x>,
+                    me: &Call,
+                ) -> Result<PairBuilder<ProgNode<'x>>, RichError> {
+                    if index == 0 {
+                        Ok(PairBuilder::unit(scope.ctx()))
+                    } else {
+                        let left = { PairBuilder::unit(scope.ctx()) };
+                        let right = recurse_padding(index - 1, scope, me)?;
+                        let pair = left.pair(right);
+                        let drop_iden = ProgNode::drop_(&ProgNode::iden(scope.ctx()));
+                        pair.comp(&drop_iden).with_span(me)
+                    }
+                }
+                recurse_padding(size.get(), scope, self)
             }
             CallName::TypeCast(..) => {
                 // A cast converts between two structurally equal types.
