@@ -288,7 +288,7 @@ pub enum CallName {
     /// [`dbg!`].
     Debug,
     /// [`padding!`]
-    Padding,
+    Padding(NonZeroUsize),
     /// Cast from the given source type.
     TypeCast(ResolvedType),
     /// A custom function that was defined previously.
@@ -1186,14 +1186,13 @@ impl AbstractSyntaxTree for Call {
                 scope.track_call(from, TrackedCallName::Debug(arg_ty));
                 args
             }
-            CallName::Padding => {
-                let args_tys = [ResolvedType::u16()];
+            CallName::Padding(_size) => {
+                let args_tys = [];
                 check_argument_types(from.args(), &args_tys).with_span(from)?;
                 let args = analyze_arguments(from.args(), &args_tys, scope)?;
                 scope.track_call(from, TrackedCallName::Padding);
 
                 args
-                // todo!("Fix analyze");
             }
             CallName::TypeCast(source) => {
                 if StructuralType::from(&source) != StructuralType::from(ty) {
@@ -1322,7 +1321,7 @@ impl AbstractSyntaxTree for CallName {
             parse::CallName::Assert => Ok(Self::Assert),
             parse::CallName::Panic => Ok(Self::Panic),
             parse::CallName::Debug => Ok(Self::Debug),
-            parse::CallName::Padding => Ok(Self::Padding),
+            parse::CallName::Padding(size) => Ok(Self::Padding(*size)),
             parse::CallName::TypeCast(target) => {
                 scope.resolve(target).map(Self::TypeCast).with_span(from)
             }
@@ -1585,7 +1584,7 @@ impl AsRef<Span> for ModuleAssignment {
 
 #[cfg(test)]
 mod test {
-    use crate::parse::ParseFromStr;
+    use crate::{error, parse::ParseFromStr};
 
     use super::*;
 
@@ -1597,7 +1596,7 @@ mod test {
         let parsed_if = match parsed_expr.inner() {
             parse::ExpressionInner::Single(single) => match single.inner() {
                 parse::SingleExpressionInner::Call(call) => match call.name() {
-                    parse::CallName::Padding => call.clone(),
+                    parse::CallName::Padding(_) => call.clone(),
                     _ => panic!("Expected padding call"),
                 },
                 _ => panic!("Expected If expression"),
@@ -1608,8 +1607,8 @@ mod test {
     }
 
     #[test]
-    fn test_ast_parse_padding() {
-        let input = "padding!(10)";
+    fn test_ast_padding() {
+        let input = "padding::<10>()";
 
         let parsed_call = &parse_padding(input);
 
@@ -1622,37 +1621,19 @@ mod test {
         // Verify the structure
         assert_eq!(
             ast_padding.args().len(),
-            1,
+            0,
             "Args did not analyse correctly"
         );
         assert_eq!(
             ast_padding.name(),
-            &CallName::Padding,
+            &CallName::Padding(NonZeroUsize::new(10).unwrap()),
             "Call name was not padding"
         );
     }
 
     #[test]
-    fn test_ast_parse_padding_should_fail_with_multiple_args() {
-        let input = "padding!(10, 22)";
-
-        let parsed_call = &parse_padding(input);
-
-        // Analyze the if expression with u8 as the expected type
-        let expected_type = ResolvedType::unit();
-        let mut scope = Scope::default();
-
-        let res = Call::analyze(parsed_call, &expected_type, &mut scope);
-
-        assert!(
-            res.is_err(),
-            "padding parsed correctly but should have failed"
-        );
-    }
-
-    #[test]
-    fn test_ast_parse_padding_should_fail_with_incorrect_args() {
-        let input = "padding!(\"lots\")";
+    fn test_ast_padding_should_fail_with_args() {
+        let input = "padding::<10>(1)";
 
         let parsed_call = &parse_padding(input);
 
@@ -1662,7 +1643,10 @@ mod test {
         let res = Call::analyze(parsed_call, &expected_type, &mut scope);
 
         assert!(
-            res.is_err(),
+            matches!(
+                res.unwrap_err().error(),
+                error::Error::InvalidNumberOfArguments(0, 1)
+            ),
             "padding parsed correctly but should have failed"
         );
     }

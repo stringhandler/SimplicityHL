@@ -423,7 +423,9 @@ impl Call {
                 let iden = ProgNode::iden(scope.ctx());
                 scope.with_debug_symbol(args, &iden, self)
             }
-            CallName::Padding => {
+            CallName::Padding(_size) => {
+                // let num_bytes = args.
+
                 todo!("Fix compile");
             }
             CallName::TypeCast(..) => {
@@ -681,5 +683,35 @@ impl Match {
         let input = scrutinee.pair(PairBuilder::iden(scope.ctx()));
         let output = ProgNode::case(left.as_ref(), right.as_ref()).with_span(self)?;
         input.comp(&output).with_span(self)
+    }
+}
+
+#[cfg(test)]
+mod test {
+
+    use crate::{
+        ast,
+        parse::{self, ParseFromStr},
+    };
+
+    use super::*;
+
+    fn compile_program(
+        input: &str,
+    ) -> Result<Arc<named::CommitNode<Elements>>, crate::error::RichError> {
+        let parse_program = parse::Program::parse_from_str(input).expect("Failed to parse");
+        let ast_program = ast::Program::analyze(&parse_program).expect("Failed to analyze");
+        ast_program.compile(Arguments::default(), false)
+    }
+
+    #[test]
+    fn test_padding_compiles() {
+        let input_program = r#"
+        fn main() {
+            padding::<20>();
+        }"#;
+
+        let padding_node =
+            compile_program(input_program).expect("padding expression should compile");
     }
 }
