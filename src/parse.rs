@@ -6,25 +6,27 @@ use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use either::Either;
-use itertools::Itertools;
-use miniscript::iter::{Tree, TreeLike};
-use pest::Parser;
-use pest_derive::Parser;
+use chumsky::input::{Input, ValueInput};
+use chumsky::prelude::{
+    any, choice, empty, just, nested_delimiters, none_of, one_of, recursive, skip_then_retry_until,
+    via_parser,
+};
+use chumsky::{extra, select, IterParser, Parser};
 
-use crate::error::{Error, RichError, Span, WithFile, WithSpan};
+use either::Either;
+use miniscript::iter::{Tree, TreeLike};
+
+use crate::error::ErrorCollector;
+use crate::error::{Error, RichError, Span};
 use crate::impl_eq_hash;
+use crate::lexer::Token;
 use crate::num::NonZeroPow2Usize;
 use crate::pattern::Pattern;
 use crate::str::{
     AliasName, Binary, Decimal, FunctionName, Hexadecimal, Identifier, JetName, ModuleName,
     WitnessName,
 };
-use crate::types::{AliasedType, BuiltinAlias, TypeConstructible, UIntType};
-
-#[derive(Parser)]
-#[grammar = "minimal.pest"]
-struct IdentParser;
+use crate::types::{AliasedType, BuiltinAlias, TypeConstructible};
 
 /// A program is a sequence of items.
 #[derive(Clone, Debug)]
@@ -274,6 +276,16 @@ impl Expression {
                 inner: ExpressionInner::Block(Arc::from([]), Some(Arc::new(self))),
             },
             _ => self,
+        }
+    }
+
+    pub fn empty(span: Span) -> Self {
+        Self {
+            inner: ExpressionInner::Single(SingleExpression {
+                inner: SingleExpressionInner::Tuple(Arc::new([])),
+                span,
+            }),
+            span,
         }
     }
 }
@@ -830,794 +842,1016 @@ impl fmt::Display for MatchPattern {
     }
 }
 
-/// Trait for types that can be parsed from a PEST pair.
-trait PestParse: Sized {
-    /// Expected rule for parsing the type.
-    const RULE: Rule;
-
-    /// Parse a value of the type from a PEST pair.
-    ///
-    /// # Panics
-    ///
-    /// The rule of the pair is not the expected rule ([`Self::RULE`]).
-    fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError>;
-}
-
 macro_rules! impl_parse_wrapped_string {
-    ($wrapper: ident, $rule: ident) => {
-        impl PestParse for $wrapper {
-            const RULE: Rule = Rule::$rule;
-
-            fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError> {
-                assert!(matches!(pair.as_rule(), Self::RULE));
-                Ok(Self::from_str_unchecked(pair.as_str()))
+    ($wrapper: ident, $label: literal) => {
+        impl ChumskyParse for $wrapper {
+            fn parser<'tokens, 'src: 'tokens, I>(
+            ) -> impl Parser<'tokens, I, Self, ParseError<'src>> + Clone
+            where
+                I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+            {
+                select! {
+                    Token::Ident(ident) => Self::from_str_unchecked(ident)
+                }
+                .labelled($label)
             }
         }
     };
 }
 
-impl_parse_wrapped_string!(FunctionName, function_name);
-impl_parse_wrapped_string!(Identifier, identifier);
-impl_parse_wrapped_string!(WitnessName, witness_name);
-impl_parse_wrapped_string!(AliasName, alias_name);
-impl_parse_wrapped_string!(ModuleName, module_name);
+impl_parse_wrapped_string!(FunctionName, "function name");
+impl_parse_wrapped_string!(Identifier, "identifier");
+impl_parse_wrapped_string!(WitnessName, "witness name");
+impl_parse_wrapped_string!(AliasName, "alias name");
+impl_parse_wrapped_string!(ModuleName, "module name");
 
-/// Copy of [`FromStr`] that internally uses the PEST parser.
+/// Copy of [`FromStr`] that internally uses the `chumsky` parser.
 pub trait ParseFromStr: Sized {
     /// Parse a value from the string `s`.
     fn parse_from_str(s: &str) -> Result<Self, RichError>;
 }
 
-impl<A: PestParse> ParseFromStr for A {
+/// Trait for parsing with collection of errors.
+pub trait ParseFromStrWithErrors: Sized {
+    /// Parse a value from the string `s` with Errors.
+    fn parse_from_str_with_errors(s: &str, handler: &mut ErrorCollector) -> Option<Self>;
+}
+
+/// Trait for generating parsers of themselves.
+///
+/// Replacement for previous `PestParse` trait.
+pub trait ChumskyParse: Sized {
+    fn parser<'tokens, 'src: 'tokens, I>() -> impl Parser<'tokens, I, Self, ParseError<'src>> + Clone
+    where
+        I: ValueInput<'tokens, Token = Token<'src>, Span = Span>;
+}
+
+type ParseError<'src> = extra::Err<RichError>;
+
+/// This implementation only returns first encountered error.
+impl<A: ChumskyParse + std::fmt::Debug> ParseFromStr for A {
     fn parse_from_str(s: &str) -> Result<Self, RichError> {
-        let mut pairs = IdentParser::parse(A::RULE, s)
-            .map_err(RichError::from)
-            .with_file(s)?;
-        let pair = pairs.next().unwrap();
-        A::parse(pair).with_file(s)
+        let (tokens, mut lex_errs) = crate::lexer::lex(s);
+
+        let Some(tokens) = tokens else {
+            return Err(lex_errs.pop().unwrap_or(RichError::parsing_error(
+                "Empty token stream without an error.",
+            )));
+        };
+
+        let (ast, parse_errs) = A::parser()
+            .map_with(|parsed, _| parsed)
+            .parse(
+                tokens
+                    .as_slice()
+                    .map((s.len()..s.len()).into(), |(t, s)| (t, s)),
+            )
+            .into_output_errors();
+
+        if parse_errs.is_empty() {
+            Ok(ast.ok_or(RichError::parsing_error("Empty AST without an error."))?)
+        } else {
+            let err = parse_errs.first().unwrap().clone();
+            Err(err)
+        }
     }
 }
 
-impl PestParse for Program {
-    const RULE: Rule = Rule::program;
+impl<A: ChumskyParse + std::fmt::Debug> ParseFromStrWithErrors for A {
+    fn parse_from_str_with_errors(s: &str, handler: &mut ErrorCollector) -> Option<Self> {
+        let (tokens, lex_errs) = crate::lexer::lex(s);
 
-    fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError> {
-        assert!(matches!(pair.as_rule(), Self::RULE));
-        let span = Span::from(&pair);
-        let items = pair
-            .into_inner()
-            .filter_map(|pair| match pair.as_rule() {
-                Rule::item => Some(Item::parse(pair)),
-                _ => None,
+        handler.update(lex_errs);
+        let tokens = tokens?;
+
+        let (ast, parse_errs) = A::parser()
+            .map_with(|parsed, _| parsed)
+            .parse(
+                tokens
+                    .as_slice()
+                    .map((s.len()..s.len()).into(), |(t, s)| (t, s)),
+            )
+            .into_output_errors();
+
+        handler.update(parse_errs);
+
+        // TODO: We should return parsed result if we found errors, but because analyzing in `ast` module
+        // is not handling poisoned tree right now, we don't return parsed result
+        if handler.get().is_empty() {
+            ast
+        } else {
+            None
+        }
+    }
+}
+
+/// Parse a token, and, if not found, place itself in place of missing one.
+///
+/// Should be only used when we know that this token should be there. For example, type of
+/// `List<ty, bound>` would require comma inside angle brackets.
+fn parse_token_with_recovery<'tokens, 'src: 'tokens, I>(
+    tok: Token<'src>,
+) -> impl Parser<'tokens, I, Token<'src>, ParseError<'src>> + Clone
+where
+    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+{
+    just(tok.clone()).recover_with(via_parser(empty().to(tok)))
+}
+
+/// Parser with error recovery for expressions, which would always contains given delimiters.
+///
+/// Can track span of open delimiter (if any).
+fn delimited_with_recovery<'tokens, 'src: 'tokens, I, P, T, F>(
+    parser: P,
+    open: Token<'src>,
+    close: Token<'src>,
+    fallback: F,
+) -> impl Parser<'tokens, I, T, ParseError<'src>> + Clone
+where
+    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+    P: Parser<'tokens, I, T, ParseError<'src>> + Clone,
+    T: Clone + 'tokens,
+    F: Fn(Span) -> T + Clone + 'tokens,
+{
+    just(open.clone())
+        .map_with(|_, e| e.span())
+        .then(parser.recover_with(via_parser(nested_delimiters(
+            open.clone(),
+            close.clone(),
+            [
+                (Token::LParen, Token::RParen),
+                (Token::LBracket, Token::RBracket),
+                (Token::LBrace, Token::RBrace),
+                (Token::LAngle, Token::RAngle),
+            ],
+            fallback,
+        ))))
+        .then(just(close).or_not())
+        // TODO: we should use information about open delimiter
+        .validate(move |((open_span, content), close_token), _, emit| {
+            if close_token.is_none() {
+                emit.emit(Error::Grammar(format!("Unclosed delimiter {open}")).with_span(open_span))
+            }
+            content
+        })
+}
+
+impl ChumskyParse for AliasedType {
+    fn parser<'tokens, 'src: 'tokens, I>() -> impl Parser<'tokens, I, Self, ParseError<'src>> + Clone
+    where
+        I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+    {
+        let atom = select! {
+            Token::Ident(ident) => {
+                match ident
+                {
+                    "u1" => AliasedType::u1(),
+                    "u2" =>  AliasedType::u2(),
+                    "u4" =>  AliasedType::u4(),
+                    "u8" => AliasedType::u8(),
+                    "u16" => AliasedType::u16(),
+                    "u32" => AliasedType::u32(),
+                    "u64" => AliasedType::u64(),
+                    "u128" => AliasedType::u128(),
+                    "u256" => AliasedType::u256(),
+                    "Ctx8" | "Pubkey" | "Message64" | "Message" | "Signature" | "Scalar" | "Fe" | "Gej"
+                    | "Ge" | "Point" | "Height" | "Time" | "Distance" | "Duration" | "Lock" | "Outpoint"
+                    | "Confidential1" | "ExplicitAsset" | "Asset1" | "ExplicitAmount" | "Amount1"
+                    | "ExplicitNonce" | "Nonce" | "TokenAmount1" => AliasedType::builtin(BuiltinAlias::from_str(ident).unwrap()),
+                    "bool" => AliasedType::boolean(),
+                    _ => AliasedType::alias(AliasName::from_str_unchecked(ident)),
+                }
+            },
+        };
+
+        let num = select! {
+            Token::DecLiteral(i) => i.clone()
+        }
+        .labelled("decimal number")
+        .recover_with(via_parser(
+            none_of([Token::RAngle, Token::RBracket])
+                .ignored()
+                .or(empty())
+                .to(Decimal::from_str_unchecked("0")),
+        ));
+
+        recursive(|ty| {
+            let args = delimited_with_recovery(
+                ty.clone()
+                    .then_ignore(parse_token_with_recovery(Token::Comma))
+                    .then(ty.clone()),
+                Token::LAngle,
+                Token::RAngle,
+                |_| {
+                    (
+                        AliasedType::alias(AliasName::from_str_unchecked("error")),
+                        AliasedType::alias(AliasName::from_str_unchecked("error")),
+                    )
+                },
+            );
+
+            let sum_type = just(Token::Ident("Either"))
+                .ignore_then(args)
+                .map(|(left, right)| AliasedType::either(left, right))
+                .labelled("Either");
+
+            let option_type = just(Token::Ident("Option"))
+                .ignore_then(delimited_with_recovery(
+                    ty.clone(),
+                    Token::LAngle,
+                    Token::RAngle,
+                    |_| AliasedType::alias(AliasName::from_str_unchecked("error")),
+                ))
+                .map(AliasedType::option)
+                .labelled("Option");
+
+            let tuple = delimited_with_recovery(
+                ty.clone()
+                    .separated_by(just(Token::Comma))
+                    .allow_trailing()
+                    .collect()
+                    .map(|s: Vec<AliasedType>| AliasedType::tuple(s)),
+                Token::LParen,
+                Token::RParen,
+                |_| AliasedType::tuple(Vec::new()),
+            )
+            .labelled("tuple");
+
+            let array = delimited_with_recovery(
+                ty.clone()
+                    .then_ignore(parse_token_with_recovery(Token::Semi))
+                    .then(num.clone())
+                    .map(|(ty, size)| {
+                        AliasedType::array(ty, usize::from_str(size.as_inner()).unwrap_or_default())
+                    }),
+                Token::LBracket,
+                Token::RBracket,
+                |_| {
+                    AliasedType::array(
+                        AliasedType::alias(AliasName::from_str_unchecked("error")),
+                        0,
+                    )
+                },
+            )
+            .labelled("array");
+
+            let list = just(Token::Ident("List"))
+                .ignore_then(delimited_with_recovery(
+                    ty.then_ignore(parse_token_with_recovery(Token::Comma))
+                        .then(num.clone().validate(|num, e, emit| {
+                            match NonZeroPow2Usize::from_str(num.as_inner()) {
+                                Ok(number) => number,
+                                Err(err) => {
+                                    emit.emit(
+                                        Error::Grammar(format!("Cannot parse list bound: {err}"))
+                                            .with_span(e.span()),
+                                    );
+                                    // fallback to default value
+                                    NonZeroPow2Usize::TWO
+                                }
+                            }
+                        })),
+                    Token::LAngle,
+                    Token::RAngle,
+                    |_| {
+                        (
+                            AliasedType::alias(AliasName::from_str_unchecked("error")),
+                            NonZeroPow2Usize::TWO,
+                        )
+                    },
+                ))
+                .map(|(ty, size)| AliasedType::list(ty, size))
+                .labelled("List");
+
+            choice((sum_type, option_type, tuple, array, list, atom))
+                .map_with(|inner, _| inner)
+                .labelled("type")
+        })
+    }
+}
+
+impl ChumskyParse for Program {
+    fn parser<'tokens, 'src: 'tokens, I>() -> impl Parser<'tokens, I, Self, ParseError<'src>> + Clone
+    where
+        I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+    {
+        let skip_until_next_item = any()
+            .then(
+                any()
+                    .filter(|t| !matches!(t, Token::Fn | Token::Type | Token::Mod))
+                    .repeated(),
+            )
+            // map to empty module
+            .map_with(|_, _| Item::Module);
+
+        Item::parser()
+            .recover_with(via_parser(skip_until_next_item))
+            .repeated()
+            .collect::<Vec<Item>>()
+            .map_with(|items, e| Program {
+                items: Arc::from(items),
+                span: e.span(),
             })
-            .collect::<Result<Arc<[Item]>, RichError>>()?;
-        Ok(Program { items, span })
     }
 }
 
-impl PestParse for Item {
-    const RULE: Rule = Rule::item;
+impl ChumskyParse for Item {
+    fn parser<'tokens, 'src: 'tokens, I>() -> impl Parser<'tokens, I, Self, ParseError<'src>> + Clone
+    where
+        I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+    {
+        let func_parser = Function::parser().map(Item::Function);
+        let type_parser = TypeAlias::parser().map(Item::TypeAlias);
+        let mod_parser = Module::parser().map(|_| Item::Module);
 
-    fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError> {
-        assert!(matches!(pair.as_rule(), Self::RULE));
-        let pair = pair.into_inner().next().unwrap();
-        match pair.as_rule() {
-            Rule::type_alias => TypeAlias::parse(pair).map(Item::TypeAlias),
-            Rule::function => Function::parse(pair).map(Item::Function),
-            _ => Ok(Self::Module),
-        }
+        choice((func_parser, type_parser, mod_parser))
     }
 }
 
-impl PestParse for Function {
-    const RULE: Rule = Rule::function;
+impl ChumskyParse for Function {
+    fn parser<'tokens, 'src: 'tokens, I>() -> impl Parser<'tokens, I, Self, ParseError<'src>> + Clone
+    where
+        I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+    {
+        let params = delimited_with_recovery(
+            FunctionParam::parser()
+                .separated_by(just(Token::Comma))
+                .allow_trailing()
+                .collect::<Vec<_>>(),
+            Token::LParen,
+            Token::RParen,
+            |_| Vec::new(),
+        )
+        .map(Arc::from)
+        .labelled("function parameters");
 
-    fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError> {
-        assert!(matches!(pair.as_rule(), Self::RULE));
-        let span = Span::from(&pair);
-        let mut it = pair.into_inner();
-        let _fn_keyword = it.next().unwrap();
-        let name = FunctionName::parse(it.next().unwrap())?;
-        let params = {
-            let pair = it.next().unwrap();
-            debug_assert!(matches!(pair.as_rule(), Rule::function_params));
-            pair.into_inner()
-                .map(FunctionParam::parse)
-                .collect::<Result<Arc<[FunctionParam]>, RichError>>()?
-        };
-        let ret = match it.peek().unwrap().as_rule() {
-            Rule::function_return => {
-                let pair = it.next().unwrap();
-                debug_assert!(matches!(pair.as_rule(), Rule::function_return));
-                let pair = pair.into_inner().next().unwrap();
-                let ty = AliasedType::parse(pair)?;
-                Some(ty)
-            }
-            _ => None,
-        };
-        let body = Expression::parse(it.next().unwrap())?;
+        let ret = just(Token::Arrow)
+            .ignore_then(AliasedType::parser())
+            .or_not()
+            .labelled("return type");
 
-        Ok(Self {
-            name,
-            params,
-            ret,
-            body,
-            span,
+        let body = just(Token::LBrace)
+            .rewind()
+            .ignore_then(Expression::parser())
+            .recover_with(via_parser(nested_delimiters(
+                Token::LBrace,
+                Token::RBrace,
+                [
+                    (Token::LParen, Token::RParen),
+                    (Token::LBracket, Token::RBracket),
+                ],
+                Expression::empty,
+            )))
+            .labelled("function body");
+
+        just(Token::Fn)
+            .ignore_then(FunctionName::parser())
+            .then(params)
+            .then(ret)
+            .then(body)
+            .map_with(|(((name, params), ret), body), e| Self {
+                name,
+                params,
+                ret,
+                body,
+                span: e.span(),
+            })
+    }
+}
+
+impl ChumskyParse for FunctionParam {
+    fn parser<'tokens, 'src: 'tokens, I>() -> impl Parser<'tokens, I, Self, ParseError<'src>> + Clone
+    where
+        I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+    {
+        let identifier = Identifier::parser();
+
+        let ty = AliasedType::parser();
+
+        identifier
+            .then_ignore(just(Token::Colon))
+            .then(ty)
+            .map(|(identifier, ty)| Self { identifier, ty })
+    }
+}
+
+impl Statement {
+    fn parser<'tokens, 'src: 'tokens, I, E>(
+        expr: E,
+    ) -> impl Parser<'tokens, I, Self, ParseError<'src>> + Clone
+    where
+        I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+        E: Parser<'tokens, I, Expression, ParseError<'src>> + Clone + 'tokens,
+    {
+        let assignment = Assignment::parser(expr.clone()).map(Statement::Assignment);
+
+        let expression = expr.map(Statement::Expression);
+
+        choice((assignment, expression))
+    }
+}
+
+impl Assignment {
+    fn parser<'tokens, 'src: 'tokens, I, E>(
+        expr: E,
+    ) -> impl Parser<'tokens, I, Self, ParseError<'src>> + Clone
+    where
+        I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+        E: Parser<'tokens, I, Expression, ParseError<'src>> + Clone + 'tokens,
+    {
+        just(Token::Let)
+            .ignore_then(Pattern::parser())
+            .then_ignore(parse_token_with_recovery(Token::Colon))
+            .then(AliasedType::parser())
+            .then_ignore(parse_token_with_recovery(Token::Eq))
+            .then(expr)
+            .map_with(|((pattern, ty), expression), e| Self {
+                pattern,
+                ty,
+                expression,
+                span: e.span(),
+            })
+    }
+}
+
+impl ChumskyParse for Pattern {
+    fn parser<'tokens, 'src: 'tokens, I>() -> impl Parser<'tokens, I, Self, ParseError<'src>> + Clone
+    where
+        I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+    {
+        recursive(|pat| {
+            let variable = Identifier::parser().map(Pattern::Identifier);
+
+            let ignore = select! {
+                Token::Ident("_") => Pattern::Ignore,
+            };
+
+            let tuple = delimited_with_recovery(
+                pat.clone()
+                    .separated_by(just(Token::Comma))
+                    .allow_trailing()
+                    .collect::<Vec<_>>(),
+                Token::LParen,
+                Token::RParen,
+                |_| Vec::new(),
+            )
+            .map(Pattern::tuple);
+
+            let array = delimited_with_recovery(
+                pat.clone()
+                    .separated_by(just(Token::Comma))
+                    .allow_trailing()
+                    .collect::<Vec<_>>(),
+                Token::LBracket,
+                Token::RBracket,
+                |_| Vec::new(),
+            )
+            .map(Pattern::array);
+
+            choice((ignore, variable, tuple, array)).labelled("pattern")
         })
     }
 }
 
-impl PestParse for FunctionParam {
-    const RULE: Rule = Rule::typed_identifier;
+impl Call {
+    fn parser<'tokens, 'src: 'tokens, I, E>(
+        expr: E,
+    ) -> impl Parser<'tokens, I, Self, ParseError<'src>> + Clone
+    where
+        I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+        E: Parser<'tokens, I, Expression, ParseError<'src>> + Clone + 'tokens,
+    {
+        let args = delimited_with_recovery(
+            expr.separated_by(just(Token::Comma))
+                .allow_trailing()
+                .collect::<Vec<_>>(),
+            Token::LParen,
+            Token::RParen,
+            |_| Vec::new(),
+        )
+        .map(Arc::from)
+        .labelled("call arguments");
 
-    fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError> {
-        assert!(matches!(pair.as_rule(), Self::RULE));
-        let mut it = pair.into_inner();
-        let identifier = Identifier::parse(it.next().unwrap())?;
-        let ty = AliasedType::parse(it.next().unwrap())?;
-        Ok(Self { identifier, ty })
+        CallName::parser()
+            .then(args)
+            .map_with(|(name, args), e| Self {
+                name,
+                args,
+                span: e.span(),
+            })
     }
 }
 
-impl PestParse for Statement {
-    const RULE: Rule = Rule::statement;
+impl ChumskyParse for CallName {
+    fn parser<'tokens, 'src: 'tokens, I>() -> impl Parser<'tokens, I, Self, ParseError<'src>> + Clone
+    where
+        I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+    {
+        let double_colon = just(Token::Colon).then(just(Token::Colon)).labelled("::");
 
-    fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError> {
-        assert!(matches!(pair.as_rule(), Self::RULE));
-        let inner_pair = pair.into_inner().next().unwrap();
-        match inner_pair.as_rule() {
-            Rule::assignment => Assignment::parse(inner_pair).map(Statement::Assignment),
-            Rule::expression => Expression::parse(inner_pair).map(Statement::Expression),
-            _ => unreachable!("Corrupt grammar"),
-        }
+        let turbofish_start = double_colon.clone().then(just(Token::LAngle)).ignored();
+
+        let generics_close = just(Token::RAngle);
+
+        let type_cast = just(Token::LAngle)
+            .ignore_then(AliasedType::parser())
+            .then_ignore(generics_close.clone())
+            .then_ignore(just(Token::Colon).then(just(Token::Colon)))
+            .then_ignore(just(Token::Ident("into")))
+            .map(CallName::TypeCast);
+
+        let builtin_generic_ty = |name: &'static str, ctor: fn(AliasedType) -> Self| {
+            just(Token::Ident(name))
+                .ignore_then(turbofish_start.clone())
+                .ignore_then(AliasedType::parser())
+                .then_ignore(generics_close.clone())
+                .map(ctor)
+        };
+
+        let unwrap_left = builtin_generic_ty("unwrap_left", CallName::UnwrapLeft);
+        let unwrap_right = builtin_generic_ty("unwrap_right", CallName::UnwrapRight);
+        let is_none = builtin_generic_ty("is_none", CallName::IsNone);
+
+        let fold = just(Token::Ident("fold"))
+            .ignore_then(turbofish_start.clone())
+            .ignore_then(FunctionName::parser())
+            .then_ignore(parse_token_with_recovery(Token::Comma))
+            .then(select! { Token::DecLiteral(s) => s }.labelled("list size"))
+            .then_ignore(generics_close.clone())
+            .validate(|(func, bound_str), e, emit| {
+                let bound = match bound_str.as_inner().parse::<usize>() {
+                    Ok(num) => match NonZeroPow2Usize::new(num) {
+                        Some(val) => val,
+                        None => {
+                            emit.emit(Error::ListBoundPow2(num).with_span(e.span()));
+                            NonZeroPow2Usize::TWO
+                        }
+                    },
+                    Err(_) => {
+                        emit.emit(
+                            Error::CannotParse(format!("Invalid number: {}", bound_str))
+                                .with_span(e.span()),
+                        );
+                        NonZeroPow2Usize::TWO
+                    }
+                };
+
+                CallName::Fold(func, bound)
+            });
+
+        let array_fold = just(Token::Ident("array_fold"))
+            .ignore_then(turbofish_start.clone())
+            .ignore_then(FunctionName::parser())
+            .then_ignore(parse_token_with_recovery(Token::Comma))
+            .then(select! { Token::DecLiteral(s) => s }.labelled("array size"))
+            .then_ignore(generics_close.clone())
+            .validate(|(func, size_str), e, emit| {
+                let size = match size_str.as_inner().parse::<usize>() {
+                    Ok(0) => {
+                        emit.emit(Error::ArraySizeNonZero(0).with_span(e.span()));
+                        NonZeroUsize::new(1).unwrap()
+                    }
+                    Ok(n) => NonZeroUsize::new(n).unwrap(),
+                    Err(_) => {
+                        emit.emit(
+                            Error::CannotParse(format!("Invalid number: {}", size_str))
+                                .with_span(e.span()),
+                        );
+                        NonZeroUsize::new(1).unwrap()
+                    }
+                };
+
+                CallName::ArrayFold(func, size)
+            });
+
+        let for_while = just(Token::Ident("for_while"))
+            .ignore_then(turbofish_start.clone())
+            .ignore_then(FunctionName::parser())
+            .then_ignore(generics_close.clone())
+            .map(CallName::ForWhile);
+
+        let simple_builtins = select! {
+            Token::Ident("unwrap") => CallName::Unwrap,
+            Token::Macro("assert!") => CallName::Assert,
+            Token::Macro("panic!") => CallName::Panic,
+            Token::Macro("dbg!") => CallName::Debug,
+        };
+
+        let jet = select! { Token::Jet(s) => JetName::from_str_unchecked(s) }.map(CallName::Jet);
+
+        let custom_func = FunctionName::parser().map(CallName::Custom);
+
+        choice((
+            type_cast,
+            unwrap_left,
+            unwrap_right,
+            is_none,
+            fold,
+            array_fold,
+            for_while,
+            simple_builtins,
+            jet,
+            custom_func,
+        ))
     }
 }
 
-impl PestParse for Pattern {
-    const RULE: Rule = Rule::pattern;
+impl ChumskyParse for TypeAlias {
+    fn parser<'tokens, 'src: 'tokens, I>() -> impl Parser<'tokens, I, Self, ParseError<'src>> + Clone
+    where
+        I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+    {
+        let name = AliasName::parser().map_with(|name, e| (name, e.span()));
 
-    fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError> {
-        assert!(matches!(pair.as_rule(), Self::RULE));
-        let pair = PatternPair(pair);
-        let mut output = vec![];
-
-        for data in pair.post_order_iter() {
-            match data.node.0.as_rule() {
-                Rule::pattern => {}
-                Rule::variable_pattern => {
-                    let identifier = Identifier::parse(data.node.0.into_inner().next().unwrap())?;
-                    output.push(Pattern::Identifier(identifier));
-                }
-                Rule::ignore_pattern => {
-                    output.push(Pattern::Ignore);
-                }
-                Rule::tuple_pattern => {
-                    let size = data.node.n_children();
-                    let elements = output.split_off(output.len() - size);
-                    debug_assert_eq!(elements.len(), size);
-                    output.push(Pattern::tuple(elements));
-                }
-                Rule::array_pattern => {
-                    let size = data.node.n_children();
-                    let elements = output.split_off(output.len() - size);
-                    debug_assert_eq!(elements.len(), size);
-                    output.push(Pattern::array(elements));
-                }
-                _ => unreachable!("Corrupt grammar"),
-            }
-        }
-
-        debug_assert!(output.len() == 1);
-        Ok(output.pop().unwrap())
+        just(Token::Type)
+            .ignore_then(name)
+            .then_ignore(parse_token_with_recovery(Token::Eq))
+            .then(AliasedType::parser())
+            .then_ignore(just(Token::Semi))
+            .map_with(|(name, ty), e| Self {
+                name: name.0,
+                ty,
+                span: e.span(),
+            })
     }
 }
 
-impl PestParse for Assignment {
-    const RULE: Rule = Rule::assignment;
+impl ChumskyParse for Expression {
+    fn parser<'tokens, 'src: 'tokens, I>() -> impl Parser<'tokens, I, Self, ParseError<'src>> + Clone
+    where
+        I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+    {
+        recursive(|expr| {
+            let block = {
+                let statement = Statement::parser(expr.clone()).then_ignore(just(Token::Semi));
 
-    fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError> {
-        assert!(matches!(pair.as_rule(), Self::RULE));
-        let span = Span::from(&pair);
-        let mut it = pair.into_inner();
-        let _let_keyword = it.next().unwrap();
-        let pattern = Pattern::parse(it.next().unwrap())?;
-        let ty = AliasedType::parse(it.next().unwrap())?;
-        let expression = Expression::parse(it.next().unwrap())?;
-        Ok(Assignment {
-            pattern,
-            ty,
-            expression,
-            span,
+                let block_recovery = nested_delimiters(
+                    Token::LBrace,
+                    Token::RBrace,
+                    [
+                        (Token::LParen, Token::RParen),
+                        (Token::RAngle, Token::RAngle),
+                        (Token::LBracket, Token::RBracket),
+                    ],
+                    |span| Expression::empty(span).inner().clone(),
+                );
+
+                let statements = statement
+                    .repeated()
+                    .collect::<Vec<_>>()
+                    .map(Arc::from)
+                    .recover_with(skip_then_retry_until(
+                        block_recovery.ignored().or(any().ignored()),
+                        one_of([Token::Semi, Token::RParen, Token::RBracket, Token::RBrace])
+                            .ignored(),
+                    ));
+
+                let final_expr = expr.clone().map(Arc::new).or_not();
+
+                delimited_with_recovery(
+                    statements.then(final_expr),
+                    Token::LBrace,
+                    Token::RBrace,
+                    |_| (Arc::from(Vec::new()), None),
+                )
+                .map(|(stmts, end_expr)| ExpressionInner::Block(stmts, end_expr))
+            };
+
+            let single = SingleExpression::parser(expr.clone()).map(ExpressionInner::Single);
+
+            choice((block, single))
+                .map_with(|inner, e| Expression {
+                    inner,
+                    span: e.span(),
+                })
+                .labelled("expression")
         })
     }
 }
 
-impl PestParse for Call {
-    const RULE: Rule = Rule::call_expr;
-
-    fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError> {
-        assert!(matches!(pair.as_rule(), Self::RULE));
-        let span = Span::from(&pair);
-        let mut it = pair.into_inner();
-        let name = CallName::parse(it.next().unwrap())?;
-        let args = {
-            let pair = it.next().unwrap();
-            debug_assert!(matches!(pair.as_rule(), Rule::call_args));
-            pair.into_inner()
-                .map(Expression::parse)
-                .collect::<Result<Arc<[Expression]>, RichError>>()?
+impl SingleExpression {
+    fn parser<'tokens, 'src: 'tokens, I, E>(
+        expr: E,
+    ) -> impl Parser<'tokens, I, Self, ParseError<'src>> + Clone
+    where
+        I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+        E: Parser<'tokens, I, Expression, ParseError<'src>> + Clone + 'tokens,
+    {
+        let wrapper = |name: &'static str| {
+            select! { Token::Ident(i) if i == name => i }.ignore_then(
+                expr.clone()
+                    .delimited_by(just(Token::LParen), just(Token::RParen)),
+            )
         };
 
-        Ok(Self { name, args, span })
+        let left =
+            wrapper("Left").map(|e| SingleExpressionInner::Either(Either::Left(Arc::new(e))));
+
+        let right =
+            wrapper("Right").map(|e| SingleExpressionInner::Either(Either::Right(Arc::new(e))));
+
+        let some = wrapper("Some").map(|e| SingleExpressionInner::Option(Some(Arc::new(e))));
+
+        let none = select! { Token::Ident("None") => SingleExpressionInner::Option(None) };
+
+        let boolean = select! { Token::Bool(b) => SingleExpressionInner::Boolean(b) };
+
+        let comma_separated = expr
+            .clone()
+            .separated_by(just(Token::Comma))
+            .allow_trailing()
+            .collect::<Vec<_>>();
+
+        let array = delimited_with_recovery(
+            comma_separated.clone(),
+            Token::LBracket,
+            Token::RBracket,
+            |_| Vec::new(),
+        )
+        .map(|es| SingleExpressionInner::Array(Arc::from(es)));
+
+        let list = just(Token::Macro("list!"))
+            .ignore_then(delimited_with_recovery(
+                comma_separated.clone(),
+                Token::LBracket,
+                Token::RBracket,
+                |_| Vec::new(),
+            ))
+            .map(|es| SingleExpressionInner::List(Arc::from(es)));
+
+        let tuple = delimited_with_recovery(
+            comma_separated.clone(),
+            Token::LParen,
+            Token::RParen,
+            |_| Vec::new(),
+        )
+        .map(|es| SingleExpressionInner::Tuple(Arc::from(es)));
+
+        let literal = select! {
+            Token::DecLiteral(s) => SingleExpressionInner::Decimal(s),
+            Token::HexLiteral(s) => SingleExpressionInner::Hexadecimal(s),
+            Token::BinLiteral(s) => SingleExpressionInner::Binary(s),
+            Token::Witness(s) => SingleExpressionInner::Witness(WitnessName::from_str_unchecked(s)),
+            Token::Param(s) => SingleExpressionInner::Parameter(WitnessName::from_str_unchecked(s)),
+        };
+
+        let call = Call::parser(expr.clone()).map(SingleExpressionInner::Call);
+
+        let match_expr = Match::parser(expr.clone()).map(SingleExpressionInner::Match);
+
+        let variable = Identifier::parser().map(SingleExpressionInner::Variable);
+
+        // Expression delimeted by parentheses
+        let expression = expr
+            .clone()
+            .delimited_by(just(Token::LParen), just(Token::RParen))
+            .map(|es| SingleExpressionInner::Expression(Arc::from(es)));
+
+        choice((
+            left, right, some, none, boolean, match_expr, expression, list, array, tuple, call,
+            literal, variable,
+        ))
+        .map_with(|inner, e| Self {
+            inner,
+            span: e.span(),
+        })
     }
 }
 
-impl PestParse for CallName {
-    const RULE: Rule = Rule::call_name;
+impl ChumskyParse for MatchPattern {
+    fn parser<'tokens, 'src: 'tokens, I>() -> impl Parser<'tokens, I, Self, ParseError<'src>> + Clone
+    where
+        I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+    {
+        let wrapper = |name: &'static str, ctor: fn(Identifier, AliasedType) -> Self| {
+            select! { Token::Ident(i) if i == name => i }
+                .ignore_then(delimited_with_recovery(
+                    Identifier::parser()
+                        .then_ignore(just(Token::Colon))
+                        .then(AliasedType::parser()),
+                    Token::LParen,
+                    Token::RParen,
+                    |_| {
+                        (
+                            Identifier::from_str_unchecked(""),
+                            AliasedType::alias(AliasName::from_str_unchecked("error")),
+                        )
+                    },
+                ))
+                .map(move |(id, ty)| ctor(id, ty))
+        };
 
-    fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError> {
-        assert!(matches!(pair.as_rule(), Self::RULE));
-        let pair = pair.into_inner().next().unwrap();
-        match pair.as_rule() {
-            Rule::jet => JetName::parse(pair).map(Self::Jet),
-            Rule::unwrap_left => {
-                let inner = pair.into_inner().next().unwrap();
-                AliasedType::parse(inner).map(Self::UnwrapLeft)
-            }
-            Rule::unwrap_right => {
-                let inner = pair.into_inner().next().unwrap();
-                AliasedType::parse(inner).map(Self::UnwrapRight)
-            }
-            Rule::is_none => {
-                let inner = pair.into_inner().next().unwrap();
-                AliasedType::parse(inner).map(Self::IsNone)
-            }
-            Rule::unwrap => Ok(Self::Unwrap),
-            Rule::assert => Ok(Self::Assert),
-            Rule::panic => Ok(Self::Panic),
-            Rule::debug => Ok(Self::Debug),
-            Rule::type_cast => {
-                let inner = pair.into_inner().next().unwrap();
-                AliasedType::parse(inner).map(Self::TypeCast)
-            }
-            Rule::fold => {
-                let mut it = pair.into_inner();
-                let name = FunctionName::parse(it.next().unwrap())?;
-                let bound = NonZeroPow2Usize::parse(it.next().unwrap())?;
-                Ok(Self::Fold(name, bound))
-            }
-            Rule::array_fold => {
-                let mut it = pair.into_inner();
-                let name = FunctionName::parse(it.next().unwrap())?;
-                let non_zero_usize_parse =
-                    |pair: pest::iterators::Pair<Rule>| -> Result<NonZeroUsize, RichError> {
-                        let size = pair.as_str().parse::<usize>().with_span(&pair)?;
-                        NonZeroUsize::new(size)
-                            .ok_or(Error::ArraySizeNonZero(size))
-                            .with_span(&pair)
+        choice((
+            wrapper("Left", MatchPattern::Left),
+            wrapper("Right", MatchPattern::Right),
+            wrapper("Some", MatchPattern::Some),
+            select! { Token::Ident("None") => MatchPattern::None },
+            select! { Token::Bool(true) => MatchPattern::True },
+            select! { Token::Bool(false) => MatchPattern::False },
+        ))
+    }
+}
+
+impl MatchArm {
+    fn parser<'tokens, 'src: 'tokens, I, E>(
+        expr: E,
+    ) -> impl Parser<'tokens, I, Self, ParseError<'src>> + Clone
+    where
+        I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+        E: Parser<'tokens, I, Expression, ParseError<'src>> + Clone + 'tokens,
+    {
+        MatchPattern::parser()
+            .then_ignore(just(Token::FatArrow))
+            .then(expr.map(Arc::new))
+            .then(just(Token::Comma).or_not())
+            .validate(|((pattern, expression), comma), e, emitter| {
+                let is_block = matches!(expression.as_ref().inner, ExpressionInner::Block(_, _));
+
+                if !is_block && comma.is_none() {
+                    emitter.emit(
+                        Error::Grammar(
+                            "Missing ',' after a match arm that isn't block expression".to_string(),
+                        )
+                        .with_span(e.span()),
+                    );
+                }
+
+                Self {
+                    pattern,
+                    expression,
+                }
+            })
+    }
+}
+
+impl Match {
+    fn parser<'tokens, 'src: 'tokens, I, E>(
+        expr: E,
+    ) -> impl Parser<'tokens, I, Self, ParseError<'src>> + Clone
+    where
+        I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+        E: Parser<'tokens, I, Expression, ParseError<'src>> + Clone + 'tokens,
+    {
+        let scrutinee = expr.clone().map(Arc::new);
+
+        let arm_recovery = any()
+            .filter(|t| !matches!(t, Token::Comma | Token::RBrace))
+            .ignored()
+            .or(nested_delimiters(
+                Token::LBrace,
+                Token::RBrace,
+                [
+                    (Token::LParen, Token::RParen),
+                    (Token::LBracket, Token::RBracket),
+                ],
+                |_| (),
+            )
+            .ignored())
+            .repeated()
+            .map_with(|(), _| None);
+
+        let arm_parser = MatchArm::parser(expr.clone())
+            .map(Some)
+            .recover_with(via_parser(arm_recovery.clone()));
+
+        let arms = delimited_with_recovery(
+            arm_parser.clone().then(arm_parser.clone()),
+            Token::LBrace,
+            Token::RBrace,
+            |_| (None, None),
+        );
+
+        just(Token::Match)
+            .ignore_then(scrutinee)
+            .then(arms)
+            .validate(|(scrutinee, arms), e, emit| match arms {
+                (Some(first), Some(second)) => {
+                    let (left, right) = match (&first.pattern, &second.pattern) {
+                        (MatchPattern::Left(..), MatchPattern::Right(..)) => (first, second),
+                        (MatchPattern::Right(..), MatchPattern::Left(..)) => (second, first),
+
+                        (MatchPattern::None, MatchPattern::Some(..)) => (first, second),
+                        (MatchPattern::Some(..), MatchPattern::None) => (second, first),
+
+                        (MatchPattern::False, MatchPattern::True) => (first, second),
+                        (MatchPattern::True, MatchPattern::False) => (second, first),
+
+                        (p1, p2) => {
+                            emit.emit(
+                                Error::IncompatibleMatchArms(p1.clone(), p2.clone())
+                                    .with_span(e.span()),
+                            );
+                            (first, second)
+                        }
                     };
-                let size = non_zero_usize_parse(it.next().unwrap())?;
-                Ok(Self::ArrayFold(name, size))
-            }
-            Rule::for_while => {
-                let mut it = pair.into_inner();
-                let name = FunctionName::parse(it.next().unwrap())?;
-                Ok(Self::ForWhile(name))
-            }
-            Rule::function_name => FunctionName::parse(pair).map(Self::Custom),
-            _ => panic!("Corrupt grammar"),
-        }
-    }
-}
 
-impl PestParse for JetName {
-    const RULE: Rule = Rule::jet;
-
-    fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError> {
-        assert!(matches!(pair.as_rule(), Self::RULE));
-        let jet_name = pair.as_str().strip_prefix("jet::").unwrap();
-        Ok(Self::from_str_unchecked(jet_name))
-    }
-}
-
-impl PestParse for TypeAlias {
-    const RULE: Rule = Rule::type_alias;
-
-    fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError> {
-        assert!(matches!(pair.as_rule(), Self::RULE));
-        let span = Span::from(&pair);
-        let mut it = pair.into_inner();
-        let _type_keyword = it.next().unwrap();
-        let name = AliasName::parse(it.next().unwrap())?;
-        let ty = AliasedType::parse(it.next().unwrap())?;
-        Ok(Self { name, ty, span })
-    }
-}
-
-impl PestParse for Expression {
-    const RULE: Rule = Rule::expression;
-
-    fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError> {
-        let span = Span::from(&pair);
-        let pair = match pair.as_rule() {
-            Rule::expression => pair.into_inner().next().unwrap(),
-            Rule::block_expression | Rule::single_expression => pair,
-            _ => unreachable!("Corrupt grammar"),
-        };
-
-        let inner = match pair.as_rule() {
-            Rule::block_expression => {
-                let mut it = pair.into_inner().peekable();
-                let statements = it
-                    .peeking_take_while(|pair| matches!(pair.as_rule(), Rule::statement))
-                    .map(Statement::parse)
-                    .collect::<Result<Arc<[Statement]>, RichError>>()?;
-                let expression = it
-                    .next()
-                    .map(|pair| Expression::parse(pair).map(Arc::new))
-                    .transpose()?;
-                ExpressionInner::Block(statements, expression)
-            }
-            Rule::single_expression => ExpressionInner::Single(SingleExpression::parse(pair)?),
-            _ => unreachable!("Corrupt grammar"),
-        };
-
-        Ok(Expression { inner, span })
-    }
-}
-
-impl PestParse for SingleExpression {
-    const RULE: Rule = Rule::single_expression;
-
-    fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError> {
-        assert!(matches!(pair.as_rule(), Self::RULE));
-
-        let span = Span::from(&pair);
-        let inner_pair = pair.into_inner().next().unwrap();
-
-        let inner = match inner_pair.as_rule() {
-            Rule::left_expr => {
-                let l = inner_pair.into_inner().next().unwrap();
-                Expression::parse(l)
-                    .map(Arc::new)
-                    .map(Either::Left)
-                    .map(SingleExpressionInner::Either)?
-            }
-            Rule::right_expr => {
-                let r = inner_pair.into_inner().next().unwrap();
-                Expression::parse(r)
-                    .map(Arc::new)
-                    .map(Either::Right)
-                    .map(SingleExpressionInner::Either)?
-            }
-            Rule::none_expr => SingleExpressionInner::Option(None),
-            Rule::some_expr => {
-                let r = inner_pair.into_inner().next().unwrap();
-                Expression::parse(r)
-                    .map(Arc::new)
-                    .map(Some)
-                    .map(SingleExpressionInner::Option)?
-            }
-            Rule::false_expr => SingleExpressionInner::Boolean(false),
-            Rule::true_expr => SingleExpressionInner::Boolean(true),
-            Rule::call_expr => SingleExpressionInner::Call(Call::parse(inner_pair)?),
-            Rule::bin_literal => Binary::parse(inner_pair).map(SingleExpressionInner::Binary)?,
-            Rule::hex_literal => {
-                Hexadecimal::parse(inner_pair).map(SingleExpressionInner::Hexadecimal)?
-            }
-            Rule::dec_literal => Decimal::parse(inner_pair).map(SingleExpressionInner::Decimal)?,
-            Rule::witness_expr => SingleExpressionInner::Witness(WitnessName::parse(
-                inner_pair.into_inner().next().unwrap(),
-            )?),
-            Rule::param_expr => SingleExpressionInner::Parameter(WitnessName::parse(
-                inner_pair.into_inner().next().unwrap(),
-            )?),
-            Rule::variable_expr => {
-                let identifier_pair = inner_pair.into_inner().next().unwrap();
-                SingleExpressionInner::Variable(Identifier::parse(identifier_pair)?)
-            }
-            Rule::expression => {
-                SingleExpressionInner::Expression(Expression::parse(inner_pair).map(Arc::new)?)
-            }
-            Rule::match_expr => Match::parse(inner_pair).map(SingleExpressionInner::Match)?,
-            Rule::tuple_expr => inner_pair
-                .clone()
-                .into_inner()
-                .map(Expression::parse)
-                .collect::<Result<Arc<[Expression]>, _>>()
-                .map(SingleExpressionInner::Tuple)?,
-            Rule::array_expr => inner_pair
-                .clone()
-                .into_inner()
-                .map(Expression::parse)
-                .collect::<Result<Arc<[Expression]>, _>>()
-                .map(SingleExpressionInner::Array)?,
-            Rule::list_expr => {
-                let elements = inner_pair
-                    .into_inner()
-                    .map(|inner| Expression::parse(inner))
-                    .collect::<Result<Arc<_>, _>>()?;
-                SingleExpressionInner::List(elements)
-            }
-            _ => unreachable!("Corrupt grammar"),
-        };
-
-        Ok(SingleExpression { inner, span })
-    }
-}
-
-impl PestParse for Decimal {
-    const RULE: Rule = Rule::dec_literal;
-
-    fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError> {
-        assert!(matches!(pair.as_rule(), Self::RULE));
-        let decimal = pair.as_str().replace('_', "");
-        Ok(Self::from_str_unchecked(decimal.as_str()))
-    }
-}
-
-impl PestParse for Binary {
-    const RULE: Rule = Rule::bin_literal;
-
-    fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError> {
-        assert!(matches!(pair.as_rule(), Self::RULE));
-        let binary = pair.as_str().strip_prefix("0b").unwrap().replace('_', "");
-        Ok(Self::from_str_unchecked(binary.as_str()))
-    }
-}
-
-impl PestParse for Hexadecimal {
-    const RULE: Rule = Rule::hex_literal;
-
-    fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError> {
-        assert!(matches!(pair.as_rule(), Self::RULE));
-        let hexadecimal = pair.as_str().strip_prefix("0x").unwrap().replace('_', "");
-        Ok(Self::from_str_unchecked(hexadecimal.as_str()))
-    }
-}
-
-impl PestParse for Match {
-    const RULE: Rule = Rule::match_expr;
-
-    fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError> {
-        assert!(matches!(pair.as_rule(), Self::RULE));
-        let span = Span::from(&pair);
-        let mut it = pair.into_inner();
-        let _match_keyword = it.next().unwrap();
-        let scrutinee_pair = it.next().unwrap();
-        let scrutinee = Expression::parse(scrutinee_pair.clone()).map(Arc::new)?;
-        let first = MatchArm::parse(it.next().unwrap())?;
-        let second = MatchArm::parse(it.next().unwrap())?;
-
-        let (left, right) = match (&first.pattern, &second.pattern) {
-            (MatchPattern::Left(..), MatchPattern::Right(..)) => (first, second),
-            (MatchPattern::Right(..), MatchPattern::Left(..)) => (second, first),
-            (MatchPattern::None, MatchPattern::Some(..)) => (first, second),
-            (MatchPattern::False, MatchPattern::True) => (first, second),
-            (MatchPattern::Some(..), MatchPattern::None) => (second, first),
-            (MatchPattern::True, MatchPattern::False) => (second, first),
-            (p1, p2) => {
-                return Err(Error::IncompatibleMatchArms(p1.clone(), p2.clone())).with_span(span)
-            }
-        };
-
-        Ok(Self {
-            scrutinee,
-            left,
-            right,
-            span,
-        })
-    }
-}
-
-impl PestParse for MatchArm {
-    const RULE: Rule = Rule::match_arm;
-
-    fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError> {
-        assert!(matches!(pair.as_rule(), Self::RULE));
-        let mut it = pair.into_inner();
-        let pattern = MatchPattern::parse(it.next().unwrap())?;
-        let expression = Expression::parse(it.next().unwrap()).map(Arc::new)?;
-        Ok(MatchArm {
-            pattern,
-            expression,
-        })
-    }
-}
-
-impl PestParse for MatchPattern {
-    const RULE: Rule = Rule::match_pattern;
-
-    fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError> {
-        assert!(matches!(pair.as_rule(), Self::RULE));
-        let pair = pair.into_inner().next().unwrap();
-        let ret = match pair.as_rule() {
-            rule @ (Rule::left_pattern | Rule::right_pattern | Rule::some_pattern) => {
-                let mut it = pair.into_inner();
-                let identifier = Identifier::parse(it.next().unwrap())?;
-                let ty = AliasedType::parse(it.next().unwrap())?;
-
-                match rule {
-                    Rule::left_pattern => MatchPattern::Left(identifier, ty),
-                    Rule::right_pattern => MatchPattern::Right(identifier, ty),
-                    Rule::some_pattern => MatchPattern::Some(identifier, ty),
-                    _ => unreachable!("Covered by outer match"),
+                    Self {
+                        scrutinee,
+                        left,
+                        right,
+                        span: e.span(),
+                    }
                 }
-            }
-            Rule::none_pattern => MatchPattern::None,
-            Rule::false_pattern => MatchPattern::False,
-            Rule::true_pattern => MatchPattern::True,
-            _ => unreachable!("Corrupt grammar"),
-        };
-        Ok(ret)
-    }
-}
+                _ => {
+                    let match_arm_fallback = MatchArm {
+                        expression: Arc::new(Expression::empty(Span::new(0, 0))),
+                        pattern: MatchPattern::False,
+                    };
 
-impl PestParse for AliasedType {
-    const RULE: Rule = Rule::ty;
-
-    fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError> {
-        enum Item {
-            Type(AliasedType),
-            Size(usize),
-            Bound(NonZeroPow2Usize),
-        }
-
-        impl Item {
-            fn unwrap_type(self) -> AliasedType {
-                match self {
-                    Item::Type(ty) => ty,
-                    _ => panic!("Not a type"),
+                    let (left, right) = (
+                        arms.0.unwrap_or(match_arm_fallback.clone()),
+                        arms.1.unwrap_or(match_arm_fallback.clone()),
+                    );
+                    Self {
+                        scrutinee,
+                        left,
+                        right,
+                        span: e.span(),
+                    }
                 }
-            }
-
-            fn unwrap_size(self) -> usize {
-                match self {
-                    Item::Size(size) => size,
-                    _ => panic!("Not a size"),
-                }
-            }
-
-            fn unwrap_bound(self) -> NonZeroPow2Usize {
-                match self {
-                    Item::Bound(size) => size,
-                    _ => panic!("Not a bound"),
-                }
-            }
-        }
-
-        assert!(matches!(pair.as_rule(), Self::RULE));
-        let pair = TyPair(pair);
-        let mut output = vec![];
-
-        for data in pair.post_order_iter() {
-            match data.node.0.as_rule() {
-                Rule::alias_name => {
-                    let name = AliasName::parse(data.node.0)?;
-                    output.push(Item::Type(AliasedType::alias(name)));
-                }
-                Rule::builtin_alias => {
-                    let builtin = BuiltinAlias::parse(data.node.0)?;
-                    output.push(Item::Type(AliasedType::builtin(builtin)));
-                }
-                Rule::unsigned_type => {
-                    let uint_ty = UIntType::parse(data.node.0)?;
-                    output.push(Item::Type(AliasedType::from(uint_ty)));
-                }
-                Rule::sum_type => {
-                    let r = output.pop().unwrap().unwrap_type();
-                    let l = output.pop().unwrap().unwrap_type();
-                    output.push(Item::Type(AliasedType::either(l, r)));
-                }
-                Rule::option_type => {
-                    let r = output.pop().unwrap().unwrap_type();
-                    output.push(Item::Type(AliasedType::option(r)));
-                }
-                Rule::boolean_type => {
-                    output.push(Item::Type(AliasedType::boolean()));
-                }
-                Rule::tuple_type => {
-                    let size = data.node.n_children();
-                    let elements: Vec<AliasedType> = output
-                        .split_off(output.len() - size)
-                        .into_iter()
-                        .map(Item::unwrap_type)
-                        .collect();
-                    debug_assert_eq!(elements.len(), size);
-                    output.push(Item::Type(AliasedType::tuple(elements)));
-                }
-                Rule::array_type => {
-                    let size = output.pop().unwrap().unwrap_size();
-                    let el = output.pop().unwrap().unwrap_type();
-                    output.push(Item::Type(AliasedType::array(el, size)));
-                }
-                Rule::array_size => {
-                    let size_str = data.node.0.as_str();
-                    let size = size_str.parse::<usize>().with_span(&data.node.0)?;
-                    output.push(Item::Size(size));
-                }
-                Rule::list_type => {
-                    let bound = output.pop().unwrap().unwrap_bound();
-                    let el = output.pop().unwrap().unwrap_type();
-                    output.push(Item::Type(AliasedType::list(el, bound)));
-                }
-                Rule::list_bound => {
-                    let bound = NonZeroPow2Usize::parse(data.node.0)?;
-                    output.push(Item::Bound(bound));
-                }
-                Rule::ty => {}
-                _ => unreachable!("Corrupt grammar"),
-            }
-        }
-
-        debug_assert!(output.len() == 1);
-        Ok(output.pop().unwrap().unwrap_type())
-    }
-}
-
-impl PestParse for UIntType {
-    const RULE: Rule = Rule::unsigned_type;
-
-    fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError> {
-        assert!(matches!(pair.as_rule(), Self::RULE));
-        let ret = match pair.as_str() {
-            "u1" => UIntType::U1,
-            "u2" => UIntType::U2,
-            "u4" => UIntType::U4,
-            "u8" => UIntType::U8,
-            "u16" => UIntType::U16,
-            "u32" => UIntType::U32,
-            "u64" => UIntType::U64,
-            "u128" => UIntType::U128,
-            "u256" => UIntType::U256,
-            _ => unreachable!("Corrupt grammar"),
-        };
-        Ok(ret)
-    }
-}
-
-impl PestParse for BuiltinAlias {
-    const RULE: Rule = Rule::builtin_alias;
-
-    fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError> {
-        assert!(matches!(pair.as_rule(), Self::RULE));
-        Self::from_str(pair.as_str())
-            .map_err(Error::CannotParse)
-            .with_span(&pair)
-    }
-}
-
-impl PestParse for NonZeroPow2Usize {
-    // FIXME: This equates NonZeroPow2Usize with list bounds. Create wrapper for list bounds?
-    const RULE: Rule = Rule::list_bound;
-
-    fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError> {
-        assert!(matches!(pair.as_rule(), Self::RULE));
-        let bound = pair.as_str().parse::<usize>().with_span(&pair)?;
-        NonZeroPow2Usize::new(bound)
-            .ok_or(Error::ListBoundPow2(bound))
-            .with_span(&pair)
-    }
-}
-
-impl PestParse for ModuleProgram {
-    const RULE: Rule = Rule::program;
-
-    fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError> {
-        assert!(matches!(pair.as_rule(), Self::RULE));
-        let span = Span::from(&pair);
-        let items = pair
-            .into_inner()
-            .filter_map(|pair| match pair.as_rule() {
-                Rule::item => Some(ModuleItem::parse(pair)),
-                _ => None,
             })
-            .collect::<Result<Arc<[ModuleItem]>, RichError>>()?;
-        Ok(Self { items, span })
     }
 }
 
-impl PestParse for ModuleItem {
-    const RULE: Rule = Rule::item;
+impl ChumskyParse for ModuleItem {
+    fn parser<'tokens, 'src: 'tokens, I>() -> impl Parser<'tokens, I, Self, ParseError<'src>> + Clone
+    where
+        I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+    {
+        let module = Module::parser().map(Self::Module);
 
-    fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError> {
-        assert!(matches!(pair.as_rule(), Self::RULE));
-        let pair = pair.into_inner().next().unwrap();
-        match pair.as_rule() {
-            Rule::module => Module::parse(pair).map(Self::Module),
-            _ => Ok(Self::Ignored),
-        }
+        module
     }
 }
 
-impl PestParse for Module {
-    const RULE: Rule = Rule::module;
-
-    fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError> {
-        assert!(matches!(pair.as_rule(), Self::RULE));
-        let span = Span::from(&pair);
-        let mut it = pair.into_inner();
-        let _mod_keyword = it.next().unwrap();
-        let name = ModuleName::parse(it.next().unwrap())?;
-        let assignments = it
-            .map(ModuleAssignment::parse)
-            .collect::<Result<Arc<[ModuleAssignment]>, RichError>>()?;
-        Ok(Self {
-            name,
-            assignments,
-            span,
-        })
+impl ChumskyParse for ModuleProgram {
+    fn parser<'tokens, 'src: 'tokens, I>() -> impl Parser<'tokens, I, Self, ParseError<'src>> + Clone
+    where
+        I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+    {
+        ModuleItem::parser()
+            .repeated()
+            .collect::<Vec<_>>()
+            .map_with(|items, e| Self {
+                items: Arc::from(items),
+                span: e.span(),
+            })
     }
 }
 
-impl PestParse for ModuleAssignment {
-    const RULE: Rule = Rule::module_assign;
+impl ChumskyParse for Module {
+    fn parser<'tokens, 'src: 'tokens, I>() -> impl Parser<'tokens, I, Self, ParseError<'src>> + Clone
+    where
+        I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+    {
+        let name = ModuleName::parser().map_with(|name, e| (name, e.span()));
 
-    fn parse(pair: pest::iterators::Pair<Rule>) -> Result<Self, RichError> {
-        assert!(matches!(pair.as_rule(), Self::RULE));
-        let span = Span::from(&pair);
-        let mut it = pair.into_inner();
-        let _const_keyword = it.next().unwrap();
-        let name = WitnessName::parse(it.next().unwrap())?;
-        let ty = AliasedType::parse(it.next().unwrap())?;
-        let expression = Expression::parse(it.next().unwrap())?;
-        Ok(Self {
-            name,
-            ty,
-            expression,
-            span,
-        })
+        let assignments = ModuleAssignment::parser()
+            .repeated()
+            .collect::<Vec<_>>()
+            .delimited_by(just(Token::LBrace), just(Token::RBrace))
+            .recover_with(via_parser(nested_delimiters(
+                Token::LBrace,
+                Token::RBrace,
+                [
+                    (Token::LParen, Token::RParen),
+                    (Token::LBracket, Token::RBracket),
+                ],
+                |_| Vec::new(),
+            )))
+            .map(Arc::from);
+
+        just(Token::Mod)
+            .ignore_then(name)
+            .then(assignments)
+            .map_with(|(name, assignments), e| Self {
+                name: name.0,
+                assignments,
+                span: e.span(),
+            })
     }
 }
 
-/// Pair of tokens from the 'pattern' rule.
-#[derive(Clone, Debug)]
-struct PatternPair<'a>(pest::iterators::Pair<'a, Rule>);
+impl ChumskyParse for ModuleAssignment {
+    fn parser<'tokens, 'src: 'tokens, I>() -> impl Parser<'tokens, I, Self, ParseError<'src>> + Clone
+    where
+        I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+    {
+        let name = WitnessName::parser();
 
-impl TreeLike for PatternPair<'_> {
-    fn as_node(&self) -> Tree<Self> {
-        let mut it = self.0.clone().into_inner();
-        match self.0.as_rule() {
-            Rule::variable_pattern | Rule::ignore_pattern => Tree::Nullary,
-            Rule::pattern => {
-                let l = it.next().unwrap();
-                Tree::Unary(PatternPair(l))
-            }
-            Rule::tuple_pattern | Rule::array_pattern => {
-                let children: Arc<[PatternPair]> = it.map(PatternPair).collect();
-                Tree::Nary(children)
-            }
-            _ => unreachable!("Corrupt grammar"),
-        }
-    }
-}
-
-/// Pair of tokens from the 'ty' rule.
-#[derive(Clone, Debug)]
-struct TyPair<'a>(pest::iterators::Pair<'a, Rule>);
-
-impl TreeLike for TyPair<'_> {
-    fn as_node(&self) -> Tree<Self> {
-        let mut it = self.0.clone().into_inner();
-        match self.0.as_rule() {
-            Rule::boolean_type
-            | Rule::unsigned_type
-            | Rule::array_size
-            | Rule::list_bound
-            | Rule::alias_name
-            | Rule::builtin_alias => Tree::Nullary,
-            Rule::ty | Rule::option_type => {
-                let l = it.next().unwrap();
-                Tree::Unary(TyPair(l))
-            }
-            Rule::sum_type | Rule::array_type | Rule::list_type => {
-                let l = it.next().unwrap();
-                let r = it.next().unwrap();
-                Tree::Binary(TyPair(l), TyPair(r))
-            }
-            Rule::tuple_type => Tree::Nary(it.map(TyPair).collect()),
-            _ => unreachable!("Corrupt grammar"),
-        }
+        just(Token::Const)
+            .ignore_then(name)
+            .then_ignore(just(Token::Colon))
+            .then(AliasedType::parser())
+            .then_ignore(just(Token::Eq))
+            .then(Expression::parser())
+            .then_ignore(just(Token::Semi))
+            .map_with(|((name, ty), expression), e| Self {
+                name,
+                ty,
+                expression,
+                span: e.span(),
+            })
     }
 }
 

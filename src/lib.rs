@@ -7,6 +7,7 @@ pub mod debug;
 pub mod dummy_env;
 pub mod error;
 pub mod jet;
+pub mod lexer;
 pub mod named;
 pub mod num;
 pub mod parse;
@@ -29,8 +30,8 @@ pub extern crate simplicity;
 pub use simplicity::elements;
 
 use crate::debug::DebugSymbols;
-use crate::error::WithFile;
-use crate::parse::ParseFromStr;
+use crate::error::{ErrorCollector, WithFile};
+use crate::parse::ParseFromStrWithErrors;
 pub use crate::types::ResolvedType;
 pub use crate::value::Value;
 pub use crate::witness::{Arguments, Parameters, WitnessTypes, WitnessValues};
@@ -52,12 +53,17 @@ impl TemplateProgram {
     /// The string is not a valid SimplicityHL program.
     pub fn new<Str: Into<Arc<str>>>(s: Str) -> Result<Self, String> {
         let file = s.into();
-        let parse_program = parse::Program::parse_from_str(&file)?;
-        let ast_program = ast::Program::analyze(&parse_program).with_file(Arc::clone(&file))?;
-        Ok(Self {
-            simfony: ast_program,
-            file,
-        })
+        let mut error_handler = ErrorCollector::new(Arc::clone(&file));
+        let parse_program = parse::Program::parse_from_str_with_errors(&file, &mut error_handler);
+        if let Some(program) = parse_program {
+            let ast_program = ast::Program::analyze(&program).with_file(Arc::clone(&file))?;
+            Ok(Self {
+                simfony: ast_program,
+                file,
+            })
+        } else {
+            Err(ErrorCollector::to_string(&error_handler))?
+        }
     }
 
     /// Access the parameters of the program.
@@ -89,6 +95,14 @@ impl TemplateProgram {
             debug_symbols: self.simfony.debug_symbols(self.file.as_ref()),
             simplicity: commit,
             witness_types: self.simfony.witness_types().shallow_clone(),
+            parameter_types: self.simfony.parameters().shallow_clone(),
+        })
+    }
+
+    pub fn generate_abi_meta(&self) -> Result<AbiMeta, String> {
+        Ok(AbiMeta {
+            witness_types: self.simfony.witness_types().shallow_clone(),
+            param_types: self.parameters().shallow_clone(),
         })
     }
 }
@@ -99,6 +113,7 @@ pub struct CompiledProgram {
     simplicity: Arc<named::CommitNode<Elements>>,
     witness_types: WitnessTypes,
     debug_symbols: DebugSymbols,
+    parameter_types: Parameters,
 }
 
 impl CompiledProgram {
@@ -162,6 +177,19 @@ impl CompiledProgram {
             debug_symbols: self.debug_symbols.clone(),
         })
     }
+
+    pub fn generate_abi_meta(&self) -> Result<AbiMeta, String> {
+        Ok(AbiMeta {
+            witness_types: self.witness_types.shallow_clone(),
+            param_types: self.parameter_types.shallow_clone(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AbiMeta {
+    pub witness_types: WitnessTypes,
+    pub param_types: Parameters,
 }
 
 /// A SimplicityHL program, compiled to Simplicity and satisfied with witness data.
@@ -265,6 +293,7 @@ pub trait ArbitraryOfType: Sized {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use crate::parse::ParseFromStr;
     use base64::display::Base64Display;
     use base64::engine::general_purpose::STANDARD;
     use simplicity::BitMachine;
@@ -365,6 +394,11 @@ pub(crate) mod tests {
                 include_fee_output: self.include_fee_output,
             }
         }
+
+        pub fn get_encoding(self) -> String {
+            let program_bytes = self.program.commit().to_vec_without_witness();
+            Base64Display::new(&program_bytes, &STANDARD).to_string()
+        }
     }
 
     impl<T> TestCase<T> {
@@ -420,6 +454,14 @@ pub(crate) mod tests {
                 Ok(()) => {}
                 Err(error) => panic!("Unexpected error: {error}"),
             }
+        }
+
+        pub fn get_encoding_with_witness(self) -> (String, String) {
+            let (program_bytes, witness_bytes) = self.program.redeem().to_vec_with_witness();
+            (
+                Base64Display::new(&program_bytes, &STANDARD).to_string(),
+                Base64Display::new(&witness_bytes, &STANDARD).to_string(),
+            )
         }
     }
 
@@ -632,7 +674,6 @@ fn main() {
     }
 
     #[test]
-    #[ignore]
     fn fuzz_slow_unit_1() {
         parse::Program::parse_from_str("fn fnnfn(MMet:(((sssss,((((((sssss,ssssss,ss,((((((sssss,ss,((((((sssss,ssssss,ss,((((((sssss,ssssss,((((((sssss,sssssssss,(((((((sssss,sssssssss,(((((ssss,((((((sssss,sssssssss,(((((((sssss,ssss,((((((sssss,ss,((((((sssss,ssssss,ss,((((((sssss,ssssss,((((((sssss,sssssssss,(((((((sssss,sssssssss,(((((ssss,((((((sssss,sssssssss,(((((((sssss,sssssssssssss,(((((((((((u|(").unwrap_err();
     }
@@ -663,5 +704,155 @@ fn main() {
         TestCase::program_text(Cow::Borrowed(prog_text))
             .with_witness_values(WitnessValues::default())
             .assert_run_success();
+    }
+
+    #[cfg(feature = "serde")]
+    mod regression {
+        use super::TestCase;
+
+        #[derive(serde::Deserialize)]
+        struct Program {
+            program: String,
+            witness: Option<String>,
+        }
+
+        fn regression_test(name: &str) {
+            let program = serde_json::from_str::<Program>(
+                std::fs::read_to_string(format!("./test-data/{}.json", name))
+                    .unwrap()
+                    .as_str(),
+            )
+            .unwrap();
+
+            let test_case = TestCase::program_file(format!("./examples/{}.simf", name));
+            match program.witness {
+                Some(wit) => {
+                    let (new_program, new_witness) = test_case
+                        .with_witness_file(format!("./examples/{}.wit", name))
+                        .get_encoding_with_witness();
+                    assert_eq!(
+                        program.program, new_program,
+                        "Byte code of programs should be the same"
+                    );
+                    assert_eq!(
+                        wit, new_witness,
+                        "Byte code of witnesses should be the same"
+                    );
+                }
+                None => {
+                    let new_program = test_case.get_encoding();
+
+                    assert_eq!(
+                        program.program, new_program,
+                        "Byte code of programs should be the same"
+                    )
+                }
+            }
+        }
+
+        #[test]
+        fn array_fold_2n_regression() {
+            regression_test("array_fold_2n");
+        }
+
+        #[test]
+        fn array_fold_regression() {
+            regression_test("array_fold");
+        }
+
+        #[test]
+        fn cat_regression() {
+            regression_test("cat");
+        }
+
+        #[test]
+        fn ctv_regression() {
+            regression_test("ctv");
+        }
+
+        #[test]
+        fn escrow_with_delay_regression() {
+            regression_test("escrow_with_delay");
+        }
+
+        #[test]
+        fn hash_loop_regression() {
+            regression_test("hash_loop");
+        }
+
+        #[test]
+        fn hodl_vault_regression() {
+            regression_test("hodl_vault");
+        }
+
+        #[test]
+        fn htlc_regression() {
+            regression_test("htlc");
+        }
+
+        #[test]
+        fn last_will_regression() {
+            regression_test("last_will");
+        }
+
+        #[test]
+        fn non_interactive_fee_bump_regression() {
+            regression_test("non_interactive_fee_bump");
+        }
+
+        #[test]
+        fn p2ms_regression() {
+            regression_test("p2ms");
+        }
+
+        #[test]
+        fn p2pkh_regression() {
+            regression_test("p2pkh");
+        }
+
+        #[test]
+        fn presigned_vault_regression() {
+            regression_test("presigned_vault");
+        }
+
+        #[test]
+        fn reveal_collision_regression() {
+            regression_test("reveal_collision");
+        }
+
+        #[test]
+        fn reveal_fix_point_regression() {
+            regression_test("reveal_fix_point");
+        }
+
+        #[test]
+        fn sighash_all_anyonecanpay_regression() {
+            regression_test("sighash_all_anyonecanpay");
+        }
+
+        #[test]
+        fn sighash_all_anyprevoutanyscript_regression() {
+            regression_test("sighash_all_anyprevoutanyscript");
+        }
+
+        #[test]
+        fn sighash_all_anyprevout_regression() {
+            regression_test("sighash_all_anyprevout");
+        }
+
+        #[test]
+        fn sighash_none_regression() {
+            regression_test("sighash_none");
+        }
+
+        #[test]
+        fn sighash_single_regression() {
+            regression_test("sighash_single");
+        }
+
+        #[test]
+        fn transfer_with_timeout_regression() {
+            regression_test("transfer_with_timeout");
+        }
     }
 }

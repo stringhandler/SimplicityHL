@@ -2,7 +2,7 @@
   "name": "simplicityhl",
   "displayName": "SimplicityHL Language Support",
   "description": "Syntax highlighting and autocompletion for SimplicityHL (Simfony) language",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "publisher": "Blockstream",
   "repository": {
     "type": "git",
@@ -28,6 +28,10 @@
         "extensions": [
           ".simf"
         ],
+        "icon": {
+          "dark": "./icons/simf.svg",
+          "light": "./icons/simf.svg"
+        },
         "configuration": "./language-configuration.json"
       },
       {
@@ -39,9 +43,12 @@
           "simplicityhl witness"
         ],
         "extensions": [
-          ".wit",
-          ".json"
+          ".wit"
         ],
+        "icon": {
+          "dark": "./icons/wit.svg",
+          "light": "./icons/wit.svg"
+        },
         "configuration": "./witness-configuration.json"
       }
     ],
@@ -202,13 +209,6 @@
           "message": 1
         },
         "severity": "error"
-      }
-    ],
-    "iconThemes": [
-      {
-        "id": "simplicityhl-icons",
-        "label": "SimplicityHL File Icons",
-        "path": "./icons/icon-theme.json"
       }
     ]
   },

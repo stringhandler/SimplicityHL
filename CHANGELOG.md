@@ -1,6 +1,14 @@
+# 0.4.1 - 2026-01-22
+
+* vscode: fix icons and .json files [#214](https://github.com/BlockstreamResearch/SimplicityHL/pull/214)
+* Feat/vscode enhance -- [#199](https://github.com/BlockstreamResearch/SimplicityHL/pull/199)
+* Bug/jet trace [#198](https://github.com/BlockstreamResearch/SimplicityHL/pull/198)
+* `analyze_named_module`: make missing modules equivalent to empty ones [#187](https://github.com/BlockstreamResearch/SimplicityHL/pull/187)
+
 # 0.4.0 - 2025-12-18
 
 * Add `DefaultTracker` [#184](https://github.com/BlockstreamResearch/SimplicityHL/pull/184)
+* feature(simc): flag for json output [#180](https://github.com/BlockstreamResearch/SimplicityHL/pull/180)
 
 # 0.3.0 - 2025-11-04
 
