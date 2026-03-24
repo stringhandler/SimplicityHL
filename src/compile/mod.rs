@@ -2,6 +2,8 @@
 
 mod builtins;
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use either::Either;
@@ -72,6 +74,10 @@ struct Scope<'brand> {
     /// Values for parameters inside the SimplicityHL program.
     arguments: Arguments,
     include_debug_symbols: bool,
+    /// Optional span annotations collected for the source map.
+    /// Maps the raw pointer of a `ProgNode` Arc to the source span that produced it.
+    /// Shared across parent and child scopes so that all nodes are captured in one pass.
+    span_annotations: Option<Arc<RefCell<HashMap<usize, Span>>>>,
 }
 
 impl<'brand> Scope<'brand> {
@@ -88,6 +94,7 @@ impl<'brand> Scope<'brand> {
         call_tracker: Arc<CallTracker>,
         arguments: Arguments,
         include_debug_symbols: bool,
+        span_annotations: Option<Arc<RefCell<HashMap<usize, Span>>>>,
     ) -> Self {
         Self {
             variables: vec![vec![Pattern::Ignore]],
@@ -95,6 +102,7 @@ impl<'brand> Scope<'brand> {
             call_tracker,
             arguments,
             include_debug_symbols,
+            span_annotations,
         }
     }
 
@@ -106,6 +114,16 @@ impl<'brand> Scope<'brand> {
             call_tracker: Arc::clone(&self.call_tracker),
             arguments: self.arguments.clone(),
             include_debug_symbols: self.include_debug_symbols,
+            span_annotations: self.span_annotations.clone(),
+        }
+    }
+
+    /// Record a span annotation for a compiled node (used for source map generation).
+    fn annotate_node(&mut self, node: &ProgNode<'brand>, span: Span) {
+        if let Some(ref annotations) = self.span_annotations {
+            annotations
+                .borrow_mut()
+                .insert(Arc::as_ptr(node) as usize, span);
         }
     }
 
@@ -263,20 +281,44 @@ impl Program {
         &self,
         arguments: Arguments,
         include_debug_symbols: bool,
-    ) -> Result<Arc<named::CommitNode<Elements>>, RichError> {
+        include_source_map: bool,
+    ) -> Result<(Arc<named::CommitNode<Elements>>, Option<HashMap<usize, Span>>), RichError> {
         types::Context::with_context(|ctx| {
+            let span_annotations = if include_source_map {
+                Some(Arc::new(RefCell::new(HashMap::<usize, Span>::new())))
+            } else {
+                None
+            };
+
             let mut scope = Scope::new(
                 ctx,
                 Arc::clone(self.call_tracker()),
                 arguments,
                 include_debug_symbols,
+                span_annotations.clone(),
             );
 
             let main = self.main();
             let construct = main.compile(&mut scope).map(PairBuilder::build)?;
+            drop(scope);
+
             // SimplicityHL types should be correct by construction. If not, assign the
             // whole main function as the span for them, which is as sensible as anything.
-            named::finalize_types(&construct).with_span(main)
+            match span_annotations {
+                Some(annotations_arc) => {
+                    let annotations = Arc::try_unwrap(annotations_arc)
+                        .expect("no other strong references to span_annotations after scope drop")
+                        .into_inner();
+                    let (commit, index_to_span) =
+                        named::finalize_types_with_source_map(&construct, &annotations)
+                            .with_span(main)?;
+                    Ok((commit, Some(index_to_span)))
+                }
+                None => {
+                    let commit = named::finalize_types(&construct).with_span(main)?;
+                    Ok((commit, None))
+                }
+            }
         })
     }
 }
@@ -365,6 +407,7 @@ impl SingleExpression {
                 "",
             )
             .with_span(self)?;
+        scope.annotate_node(expr.as_ref(), *self.as_ref());
         Ok(expr)
     }
 }

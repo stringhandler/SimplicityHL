@@ -14,6 +14,7 @@ pub mod parse;
 pub mod pattern;
 #[cfg(feature = "serde")]
 mod serde;
+pub mod source_map;
 pub mod str;
 pub mod tracker;
 pub mod types;
@@ -32,6 +33,7 @@ pub use simplicity::elements;
 use crate::debug::DebugSymbols;
 use crate::error::{ErrorCollector, WithFile};
 use crate::parse::ParseFromStrWithErrors;
+use crate::source_map::SourceMap;
 pub use crate::types::ResolvedType;
 pub use crate::value::Value;
 pub use crate::witness::{Arguments, Parameters, WitnessTypes, WitnessValues};
@@ -86,21 +88,26 @@ impl TemplateProgram {
         &self,
         arguments: Arguments,
         include_debug_symbols: bool,
+        include_source_map: bool,
     ) -> Result<CompiledProgram, String> {
         arguments
             .is_consistent(self.simfony.parameters())
             .map_err(|error| error.to_string())?;
 
-        let commit = self
+        let (commit, opt_index_to_span) = self
             .simfony
-            .compile(arguments, include_debug_symbols)
+            .compile(arguments, include_debug_symbols, include_source_map)
             .with_file(Arc::clone(&self.file))?;
+
+        let source_map = opt_index_to_span
+            .map(|index_to_span| SourceMap::new(index_to_span, self.file.as_ref()));
 
         Ok(CompiledProgram {
             debug_symbols: self.simfony.debug_symbols(self.file.as_ref()),
             simplicity: commit,
             witness_types: self.simfony.witness_types().shallow_clone(),
             parameter_types: self.simfony.parameters().shallow_clone(),
+            source_map,
         })
     }
 
@@ -119,6 +126,7 @@ pub struct CompiledProgram {
     witness_types: WitnessTypes,
     debug_symbols: DebugSymbols,
     parameter_types: Parameters,
+    source_map: Option<SourceMap>,
 }
 
 impl CompiledProgram {
@@ -132,14 +140,22 @@ impl CompiledProgram {
         s: Str,
         arguments: Arguments,
         include_debug_symbols: bool,
+        include_source_map: bool,
     ) -> Result<Self, String> {
         TemplateProgram::new(s)
-            .and_then(|template| template.instantiate(arguments, include_debug_symbols))
+            .and_then(|template| {
+                template.instantiate(arguments, include_debug_symbols, include_source_map)
+            })
     }
 
     /// Access the debug symbols for the Simplicity target code.
     pub fn debug_symbols(&self) -> &DebugSymbols {
         &self.debug_symbols
+    }
+
+    /// Access the source line map, if it was built during compilation.
+    pub fn source_map(&self) -> Option<&SourceMap> {
+        self.source_map.as_ref()
     }
 
     /// Access the Simplicity target code, without witness data.
@@ -218,7 +234,7 @@ impl SatisfiedProgram {
         witness_values: WitnessValues,
         include_debug_symbols: bool,
     ) -> Result<Self, String> {
-        let compiled = CompiledProgram::new(s, arguments, include_debug_symbols)?;
+        let compiled = CompiledProgram::new(s, arguments, include_debug_symbols, false)?;
         compiled.satisfy(witness_values)
     }
 
@@ -347,7 +363,7 @@ pub(crate) mod tests {
         }
 
         pub fn with_arguments(self, arguments: Arguments) -> TestCase<CompiledProgram> {
-            let program = match self.program.instantiate(arguments, true) {
+            let program = match self.program.instantiate(arguments, true, false) {
                 Ok(x) => x,
                 Err(error) => panic!("{error}"),
             };

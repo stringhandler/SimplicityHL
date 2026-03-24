@@ -83,6 +83,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .action(ArgAction::SetTrue)
                     .help("Additional ABI .simf contract types"),
             )
+            .arg(
+                Arg::new("build_source_map")
+                    .long("build-source-map")
+                    .action(ArgAction::SetTrue)
+                    .help(
+                        "Write a <program>.map file mapping each Simplicity node index \
+                         to the SimplicityHL source lines that generated it",
+                    ),
+            )
     };
 
     let matches = command.get_matches();
@@ -93,6 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let include_debug_symbols = matches.get_flag("debug");
     let output_json = matches.get_flag("json");
     let abi_param = matches.get_flag("abi");
+    let build_source_map = matches.get_flag("build_source_map");
 
     #[cfg(feature = "serde")]
     let args_opt: simplicityhl::Arguments = match matches.get_one::<String>("args_file") {
@@ -113,13 +123,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         simplicityhl::Arguments::default()
     };
 
-    let compiled = match CompiledProgram::new(prog_text, args_opt, include_debug_symbols) {
+    let compiled = match CompiledProgram::new(prog_text, args_opt, include_debug_symbols, build_source_map) {
         Ok(program) => program,
         Err(e) => {
             eprintln!("{}", e);
             std::process::exit(1);
         }
     };
+
+    if let Some(source_map) = compiled.source_map() {
+        let map_path = prog_path.with_extension("map");
+        let source_file = prog_path.file_name().unwrap_or_default().to_string_lossy();
+        std::fs::write(&map_path, source_map.to_map_json(&source_file))
+            .map_err(|e| e.to_string())?;
+    }
 
     #[cfg(feature = "serde")]
     let witness_opt = matches

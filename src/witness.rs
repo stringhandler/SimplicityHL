@@ -266,7 +266,7 @@ fn main() {
     assert!(jet::is_zero_32(f()));
 }"#;
 
-        match CompiledProgram::new(s, Arguments::default(), false) {
+        match CompiledProgram::new(s, Arguments::default(), false, false) {
             Ok(_) => panic!("Witness outside main was falsely accepted"),
             Err(error) => {
                 assert!(error

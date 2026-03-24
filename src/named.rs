@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use simplicity::dag::{InternalSharing, PostOrderIterItem};
@@ -8,6 +9,7 @@ use simplicity::node::{
 use simplicity::Cmr;
 use simplicity::{types, FailEntropy};
 
+use crate::error::Span;
 use crate::str::WitnessName;
 use crate::value::StructuralValue;
 use crate::witness::WitnessValues;
@@ -74,6 +76,72 @@ pub fn finalize_types<J: Jet>(
         let inner = inner.map_witness(|_| &NoWitness);
         node::CommitData::new(node.cached_data().arrow(), inner).map(Arc::new)
     })
+}
+
+/// Like [`finalize_types`], but also builds a map from Simplicity encoding index to source span.
+///
+/// Each entry in `span_annotations` maps the raw pointer of a [`ConstructNode`] (as `usize`) to
+/// the [`Span`] of the SimplicityHL expression that produced it. During the post-order traversal
+/// the same index is assigned to each [`CommitNode`] as to the corresponding [`ConstructNode`],
+/// so the returned map can be used to annotate the encoded program with source locations.
+pub fn finalize_types_with_source_map<J: Jet>(
+    node: &ConstructNode<J>,
+    span_annotations: &HashMap<usize, Span>,
+) -> Result<(Arc<CommitNode<J>>, HashMap<usize, Span>), types::Error> {
+    struct AnnotatingTranslator<'a, J: Jet> {
+        span_annotations: &'a HashMap<usize, Span>,
+        index_to_span: HashMap<usize, Span>,
+        _phantom: std::marker::PhantomData<J>,
+    }
+
+    impl<'a, J: Jet>
+        Converter<WithNames<node::Construct<'_, J>>, WithNames<node::Commit<J>>>
+        for AnnotatingTranslator<'a, J>
+    {
+        type Error = types::Error;
+
+        fn convert_witness(
+            &mut self,
+            _: &PostOrderIterItem<&ConstructNode<J>>,
+            wit: &WitnessName,
+        ) -> Result<WitnessName, types::Error> {
+            Ok(wit.shallow_clone())
+        }
+
+        fn convert_disconnect(
+            &mut self,
+            _: &PostOrderIterItem<&ConstructNode<J>>,
+            _: Option<&Arc<CommitNode<J>>>,
+            _: &NoDisconnect,
+        ) -> Result<NoDisconnect, types::Error> {
+            Ok(NoDisconnect)
+        }
+
+        fn convert_data(
+            &mut self,
+            data: &PostOrderIterItem<&ConstructNode<J>>,
+            inner: Inner<&Arc<CommitNode<J>>, J, &NoDisconnect, &WitnessName>,
+        ) -> Result<Arc<node::CommitData<J>>, types::Error> {
+            // Record the source span for this encoding index, if annotated.
+            let ptr = data.node as *const _ as usize;
+            if let Some(&span) = self.span_annotations.get(&ptr) {
+                self.index_to_span.insert(data.index, span);
+            }
+            // Type finalisation — identical to finalize_types.
+            let inner = inner
+                .map(|n| n.cached_data())
+                .map_witness(|_| &NoWitness);
+            node::CommitData::new(data.node.cached_data().arrow(), inner).map(Arc::new)
+        }
+    }
+
+    let mut translator = AnnotatingTranslator {
+        span_annotations,
+        index_to_span: HashMap::new(),
+        _phantom: std::marker::PhantomData,
+    };
+    let commit = node.convert::<InternalSharing, _, _>(&mut translator)?;
+    Ok((commit, translator.index_to_span))
 }
 
 fn translate<M, N, F, E>(

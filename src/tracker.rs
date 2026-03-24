@@ -473,7 +473,7 @@ mod tests {
     #[test]
     fn test_debug_and_jet_tracing() {
         let program = TemplateProgram::new(TEST_PROGRAM).unwrap();
-        let program = program.instantiate(Arguments::default(), true).unwrap();
+        let program = program.instantiate(Arguments::default(), true, false).unwrap();
         let satisfied = program.satisfy(WitnessValues::default()).unwrap();
 
         let (mut tracker, debug_store, jet_store) = create_test_tracker(&satisfied.debug_symbols);
@@ -542,7 +542,7 @@ mod tests {
         let env = create_test_env();
 
         let program = TemplateProgram::new(TEST_ARITHMETIC_JETS).unwrap();
-        let program = program.instantiate(Arguments::default(), true).unwrap();
+        let program = program.instantiate(Arguments::default(), true, false).unwrap();
         let satisfied = program.satisfy(WitnessValues::default()).unwrap();
 
         let (mut tracker, _, jet_store) = create_test_tracker(&satisfied.debug_symbols);
