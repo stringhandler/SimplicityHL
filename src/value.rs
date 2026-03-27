@@ -84,6 +84,36 @@ impl UIntValue {
         self.get_type() == ty
     }
 
+    /// Return the minimum value (zero) of the given unsigned integer type.
+    pub const fn min(ty: UIntType) -> Self {
+        match ty {
+            UIntType::U1 => Self::U1(0),
+            UIntType::U2 => Self::U2(0),
+            UIntType::U4 => Self::U4(0),
+            UIntType::U8 => Self::U8(0),
+            UIntType::U16 => Self::U16(0),
+            UIntType::U32 => Self::U32(0),
+            UIntType::U64 => Self::U64(0),
+            UIntType::U128 => Self::U128(0),
+            UIntType::U256 => Self::U256(crate::num::U256::MIN),
+        }
+    }
+
+    /// Return the maximum value of the given unsigned integer type.
+    pub const fn max(ty: UIntType) -> Self {
+        match ty {
+            UIntType::U1 => Self::U1(1),
+            UIntType::U2 => Self::U2(3),
+            UIntType::U4 => Self::U4(15),
+            UIntType::U8 => Self::U8(u8::MAX),
+            UIntType::U16 => Self::U16(u16::MAX),
+            UIntType::U32 => Self::U32(u32::MAX),
+            UIntType::U64 => Self::U64(u64::MAX),
+            UIntType::U128 => Self::U128(u128::MAX),
+            UIntType::U256 => Self::U256(crate::num::U256::MAX),
+        }
+    }
+
     /// Create a value of type `u1`.
     ///
     /// ## Errors

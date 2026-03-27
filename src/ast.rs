@@ -1062,6 +1062,24 @@ impl AbstractSyntaxTree for SingleExpression {
             parse::SingleExpressionInner::Match(match_) => {
                 Match::analyze(match_, ty, scope).map(SingleExpressionInner::Match)?
             }
+            parse::SingleExpressionInner::TypeMin(uint_ty) => {
+                let expected = ResolvedType::from(*uint_ty);
+                if ty != &expected {
+                    return Err(Error::ExpressionTypeMismatch(ty.clone(), expected))
+                        .with_span(from);
+                }
+                let value = Value::from(UIntValue::min(*uint_ty));
+                SingleExpressionInner::Constant(value)
+            }
+            parse::SingleExpressionInner::TypeMax(uint_ty) => {
+                let expected = ResolvedType::from(*uint_ty);
+                if ty != &expected {
+                    return Err(Error::ExpressionTypeMismatch(ty.clone(), expected))
+                        .with_span(from);
+                }
+                let value = Value::from(UIntValue::max(*uint_ty));
+                SingleExpressionInner::Constant(value)
+            }
         };
 
         Ok(Self {

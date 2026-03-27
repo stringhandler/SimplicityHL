@@ -359,6 +359,10 @@ pub enum SingleExpressionInner {
     ///
     /// The exclusive upper bound on the list size is not known at this point
     List(Arc<[Expression]>),
+    /// Minimum value of an unsigned integer type: `T::MIN`.
+    TypeMin(UIntType),
+    /// Maximum value of an unsigned integer type: `T::MAX`.
+    TypeMax(UIntType),
 }
 
 /// Match expression.
@@ -635,7 +639,9 @@ impl TreeLike for ExprTree<'_> {
                 | S::Variable(_)
                 | S::Witness(_)
                 | S::Parameter(_)
-                | S::Option(None) => Tree::Nullary,
+                | S::Option(None)
+                | S::TypeMin(_)
+                | S::TypeMax(_) => Tree::Nullary,
                 S::Option(Some(l))
                 | S::Either(Either::Left(l))
                 | S::Either(Either::Right(l))
@@ -715,6 +721,8 @@ impl fmt::Display for ExprTree<'_> {
                             write!(f, ")")?;
                         }
                     },
+                    S::TypeMin(ty) => write!(f, "{ty}::MIN")?,
+                    S::TypeMax(ty) => write!(f, "{ty}::MAX")?,
                     S::Call(..) | S::Match(..) => {}
                     S::Tuple(tuple) => {
                         if data.n_children_yielded == 0 {
@@ -1602,6 +1610,22 @@ impl SingleExpression {
             Token::Param(s) => SingleExpressionInner::Parameter(WitnessName::from_str_unchecked(s)),
         };
 
+        let type_min_max = select! {
+            Token::Ident(i) if UIntType::from_str(i).is_ok() => UIntType::from_str(i).unwrap()
+        }
+        .then_ignore(just(Token::DoubleColon))
+        .then(select! {
+            Token::Ident("MIN") => false,
+            Token::Ident("MAX") => true,
+        })
+        .map(|(ty, is_max)| {
+            if is_max {
+                SingleExpressionInner::TypeMax(ty)
+            } else {
+                SingleExpressionInner::TypeMin(ty)
+            }
+        });
+
         let call = Call::parser(expr.clone()).map(SingleExpressionInner::Call);
 
         let match_expr = Match::parser(expr.clone()).map(SingleExpressionInner::Match);
@@ -1615,8 +1639,20 @@ impl SingleExpression {
             .map(|es| SingleExpressionInner::Expression(Arc::from(es)));
 
         choice((
-            left, right, some, none, boolean, match_expr, expression, list, array, tuple, call,
-            literal, variable,
+            left,
+            right,
+            some,
+            none,
+            boolean,
+            match_expr,
+            expression,
+            list,
+            array,
+            tuple,
+            type_min_max,
+            call,
+            literal,
+            variable,
         ))
         .map_with(|inner, e| Self {
             inner,
@@ -2045,7 +2081,7 @@ impl crate::ArbitraryRec for SingleExpression {
         use SingleExpressionInner as S;
 
         let inner = match budget.checked_sub(1) {
-            None => match u.int_in_range(0..=6)? {
+            None => match u.int_in_range(0..=8)? {
                 0 => bool::arbitrary(u).map(S::Boolean),
                 1 => Binary::arbitrary(u).map(S::Binary),
                 2 => Decimal::arbitrary(u).map(S::Decimal),
@@ -2053,9 +2089,11 @@ impl crate::ArbitraryRec for SingleExpression {
                 4 => Identifier::arbitrary(u).map(S::Variable),
                 5 => WitnessName::arbitrary(u).map(S::Witness),
                 6 => Ok(S::Option(None)),
+                7 => UIntType::arbitrary(u).map(S::TypeMin),
+                8 => UIntType::arbitrary(u).map(S::TypeMax),
                 _ => unreachable!(),
             },
-            Some(new_budget) => match u.int_in_range(0..=15)? {
+            Some(new_budget) => match u.int_in_range(0..=17)? {
                 0 => bool::arbitrary(u).map(S::Boolean),
                 1 => Binary::arbitrary(u).map(S::Binary),
                 2 => Decimal::arbitrary(u).map(S::Decimal),
@@ -2101,6 +2139,8 @@ impl crate::ArbitraryRec for SingleExpression {
                         .collect::<arbitrary::Result<Arc<[Expression]>>>()?;
                     Ok(S::List(elements))
                 }
+                16 => UIntType::arbitrary(u).map(S::TypeMin),
+                17 => UIntType::arbitrary(u).map(S::TypeMax),
                 _ => unreachable!(),
             },
         }?;
