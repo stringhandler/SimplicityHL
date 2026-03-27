@@ -2245,4 +2245,60 @@ mod test {
         assert!(parse_program.is_none());
         assert!(ErrorCollector::to_string(&error_handler).contains("Expected ';', found '::'"));
     }
+
+    #[test]
+    fn test_type_min_parses() {
+        for ty_str in ["u1", "u2", "u4", "u8", "u16", "u32", "u64", "u128", "u256"] {
+            let input = format!("fn main() {{ let x: {ty_str} = {ty_str}::MIN; }}");
+            let mut error_handler = ErrorCollector::new(Arc::from(input.as_str()));
+            let result = Program::parse_from_str_with_errors(&input, &mut error_handler);
+            assert!(result.is_some(), "Failed to parse {ty_str}::MIN: {}", ErrorCollector::to_string(&error_handler));
+        }
+    }
+
+    #[test]
+    fn test_type_max_parses() {
+        for ty_str in ["u1", "u2", "u4", "u8", "u16", "u32", "u64", "u128", "u256"] {
+            let input = format!("fn main() {{ let x: {ty_str} = {ty_str}::MAX; }}");
+            let mut error_handler = ErrorCollector::new(Arc::from(input.as_str()));
+            let result = Program::parse_from_str_with_errors(&input, &mut error_handler);
+            assert!(result.is_some(), "Failed to parse {ty_str}::MAX: {}", ErrorCollector::to_string(&error_handler));
+        }
+    }
+
+    #[test]
+    fn test_type_min_max_inner_variants() {
+        use crate::types::UIntType;
+
+        let input = "u8::MIN";
+        let expr = Expression::parse_from_str(input).unwrap();
+        match expr.inner() {
+            ExpressionInner::Single(single) => match single.inner() {
+                SingleExpressionInner::TypeMin(ty) => assert_eq!(*ty, UIntType::U8),
+                other => panic!("Expected TypeMin, got {other:?}"),
+            },
+            other => panic!("Expected Single, got {other:?}"),
+        }
+
+        let input = "u256::MAX";
+        let expr = Expression::parse_from_str(input).unwrap();
+        match expr.inner() {
+            ExpressionInner::Single(single) => match single.inner() {
+                SingleExpressionInner::TypeMax(ty) => assert_eq!(*ty, UIntType::U256),
+                other => panic!("Expected TypeMax, got {other:?}"),
+            },
+            other => panic!("Expected Single, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_type_min_max_display() {
+        let input = "u8::MIN";
+        let expr = Expression::parse_from_str(input).unwrap();
+        assert_eq!(expr.to_string(), "u8::MIN");
+
+        let input = "u32::MAX";
+        let expr = Expression::parse_from_str(input).unwrap();
+        assert_eq!(expr.to_string(), "u32::MAX");
+    }
 }

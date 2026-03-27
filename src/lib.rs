@@ -718,6 +718,40 @@ fn main() {
             .assert_run_success();
     }
 
+    #[test]
+    fn type_min_max() {
+        let prog_text = r#"fn main() {
+    let a: u1 = u1::MIN;
+    let b: u1 = u1::MAX;
+    let c: u8 = u8::MIN;
+    let d: u8 = u8::MAX;
+    let e: u32 = u32::MIN;
+    let f: u32 = u32::MAX;
+    let g: u64 = u64::MIN;
+    let h: u64 = u64::MAX;
+    let i: u256 = u256::MIN;
+    let j: u256 = u256::MAX;
+    assert!(jet::eq_8(c, 0));
+    assert!(jet::eq_8(d, 255));
+    assert!(jet::eq_32(e, 0));
+    assert!(jet::eq_32(f, 4294967295));
+}"#;
+        TestCase::program_text(Cow::Borrowed(prog_text))
+            .with_witness_values(WitnessValues::default())
+            .assert_run_success();
+    }
+
+    #[test]
+    fn type_min_max_type_mismatch() {
+        let prog_text = r#"fn main() {
+    let x: u16 = u8::MIN;
+}"#;
+        assert!(
+            TemplateProgram::new(prog_text).is_err(),
+            "Type mismatch u8::MIN assigned to u16 should fail"
+        );
+    }
+
     #[cfg(feature = "serde")]
     mod regression {
         use super::TestCase;

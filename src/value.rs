@@ -1353,4 +1353,77 @@ mod tests {
             assert!(parsed_value.is_of_type(&ty));
         }
     }
+
+    #[test]
+    fn uint_min_is_zero_and_less_than_max() {
+        for ty in [
+            UIntType::U1,
+            UIntType::U2,
+            UIntType::U4,
+            UIntType::U8,
+            UIntType::U16,
+            UIntType::U32,
+            UIntType::U64,
+            UIntType::U128,
+            UIntType::U256,
+        ] {
+            let min = UIntValue::min(ty);
+            let max = UIntValue::max(ty);
+            assert!(min < max, "MIN should be less than MAX for {ty}");
+        }
+    }
+
+    #[test]
+    fn uint_max_correct_values() {
+        assert_eq!(UIntValue::min(UIntType::U1), UIntValue::U1(0));
+        assert_eq!(UIntValue::max(UIntType::U1), UIntValue::U1(1));
+
+        assert_eq!(UIntValue::min(UIntType::U2), UIntValue::U2(0));
+        assert_eq!(UIntValue::max(UIntType::U2), UIntValue::U2(3));
+
+        assert_eq!(UIntValue::min(UIntType::U4), UIntValue::U4(0));
+        assert_eq!(UIntValue::max(UIntType::U4), UIntValue::U4(15));
+
+        assert_eq!(UIntValue::min(UIntType::U8), UIntValue::U8(0));
+        assert_eq!(UIntValue::max(UIntType::U8), UIntValue::U8(u8::MAX));
+
+        assert_eq!(UIntValue::min(UIntType::U16), UIntValue::U16(0));
+        assert_eq!(UIntValue::max(UIntType::U16), UIntValue::U16(u16::MAX));
+
+        assert_eq!(UIntValue::min(UIntType::U32), UIntValue::U32(0));
+        assert_eq!(UIntValue::max(UIntType::U32), UIntValue::U32(u32::MAX));
+
+        assert_eq!(UIntValue::min(UIntType::U64), UIntValue::U64(0));
+        assert_eq!(UIntValue::max(UIntType::U64), UIntValue::U64(u64::MAX));
+
+        assert_eq!(UIntValue::min(UIntType::U128), UIntValue::U128(0));
+        assert_eq!(UIntValue::max(UIntType::U128), UIntValue::U128(u128::MAX));
+
+        assert_eq!(
+            UIntValue::min(UIntType::U256),
+            UIntValue::U256(crate::num::U256::MIN)
+        );
+        assert_eq!(
+            UIntValue::max(UIntType::U256),
+            UIntValue::U256(crate::num::U256::MAX)
+        );
+    }
+
+    #[test]
+    fn uint_min_max_type_preserved() {
+        for ty in [
+            UIntType::U1,
+            UIntType::U2,
+            UIntType::U4,
+            UIntType::U8,
+            UIntType::U16,
+            UIntType::U32,
+            UIntType::U64,
+            UIntType::U128,
+            UIntType::U256,
+        ] {
+            assert_eq!(UIntValue::min(ty).get_type(), ty);
+            assert_eq!(UIntValue::max(ty).get_type(), ty);
+        }
+    }
 }
