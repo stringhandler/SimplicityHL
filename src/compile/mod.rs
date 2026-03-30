@@ -258,14 +258,18 @@ fn compile_blk<'brand>(
             scope.insert(assignment.pattern().clone());
             let left = expr.pair(PairBuilder::iden(scope.ctx()));
             let right = compile_blk(stmts, scope, index + 1, last_expr)?;
-            left.comp(&right).with_span(assignment)
+            let result = left.comp(&right).with_span(assignment)?;
+            scope.annotate_node(result.as_ref(), *assignment.as_ref());
+            Ok(result)
         }
         Statement::Expression(expression) => {
             let left = expression.compile(scope)?;
             let right = compile_blk(stmts, scope, index + 1, last_expr)?;
             let pair = left.pair(right);
             let drop_iden = ProgNode::drop_(&ProgNode::iden(scope.ctx()));
-            pair.comp(&drop_iden).with_span(expression)
+            let result = pair.comp(&drop_iden).with_span(expression)?;
+            scope.annotate_node(result.as_ref(), *expression.as_ref());
+            Ok(result)
         }
     }
 }
@@ -277,12 +281,12 @@ impl Program {
     ///
     /// The supplied `arguments` are consistent with the program's parameters.
     /// Call [`Arguments::is_consistent`] before calling this method!
-    pub fn compile(
+    pub(crate) fn compile(
         &self,
         arguments: Arguments,
         include_debug_symbols: bool,
         include_source_map: bool,
-    ) -> Result<(Arc<named::CommitNode<Elements>>, Option<HashMap<usize, Span>>), RichError> {
+    ) -> Result<(Arc<named::CommitNode<Elements>>, Option<HashMap<usize, crate::source_map::NodeMeta>>), RichError> {
         types::Context::with_context(|ctx| {
             let span_annotations = if include_source_map {
                 Some(Arc::new(RefCell::new(HashMap::<usize, Span>::new())))
@@ -309,10 +313,10 @@ impl Program {
                     let annotations = Arc::try_unwrap(annotations_arc)
                         .expect("no other strong references to span_annotations after scope drop")
                         .into_inner();
-                    let (commit, index_to_span) =
+                    let (commit, node_metas) =
                         named::finalize_types_with_source_map(&construct, &annotations)
                             .with_span(main)?;
-                    Ok((commit, Some(index_to_span)))
+                    Ok((commit, Some(node_metas)))
                 }
                 None => {
                     let commit = named::finalize_types(&construct).with_span(main)?;
@@ -720,6 +724,8 @@ impl Match {
         let scrutinee = self.scrutinee().compile(scope)?;
         let input = scrutinee.pair(PairBuilder::iden(scope.ctx()));
         let output = ProgNode::case(left.as_ref(), right.as_ref()).with_span(self)?;
-        input.comp(&output).with_span(self)
+        let result = input.comp(&output).with_span(self)?;
+        scope.annotate_node(result.as_ref(), *self.as_ref());
+        Ok(result)
     }
 }

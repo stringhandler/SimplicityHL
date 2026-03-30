@@ -94,13 +94,13 @@ impl TemplateProgram {
             .is_consistent(self.simfony.parameters())
             .map_err(|error| error.to_string())?;
 
-        let (commit, opt_index_to_span) = self
+        let (commit, opt_node_metas) = self
             .simfony
             .compile(arguments, include_debug_symbols, include_source_map)
             .with_file(Arc::clone(&self.file))?;
 
-        let source_map = opt_index_to_span
-            .map(|index_to_span| SourceMap::new(index_to_span, self.file.as_ref()));
+        let source_map = opt_node_metas
+            .map(|node_metas| SourceMap::new(node_metas, self.file.as_ref()));
 
         Ok(CompiledProgram {
             debug_symbols: self.simfony.debug_symbols(self.file.as_ref()),
@@ -491,6 +491,99 @@ pub(crate) mod tests {
         TestCase::program_file("./examples/cat.simf")
             .with_witness_values(WitnessValues::default())
             .assert_run_success();
+    }
+
+    #[test]
+    fn source_map_is_none_when_disabled() {
+        let prog_text = "fn main() {\n    let x: u8 = 42;\n}\n";
+        let compiled =
+            CompiledProgram::new(prog_text, Arguments::default(), false, false).unwrap();
+        assert!(compiled.source_map().is_none());
+    }
+
+    #[test]
+    fn source_map_is_some_when_enabled() {
+        let prog_text = "fn main() {\n    let x: u8 = 42;\n}\n";
+        let compiled =
+            CompiledProgram::new(prog_text, Arguments::default(), false, true).unwrap();
+        assert!(compiled.source_map().is_some());
+    }
+
+    #[test]
+    fn source_map_has_entries() {
+        let prog_text = "fn main() {\n    let x: u8 = 42;\n}\n";
+        let compiled =
+            CompiledProgram::new(prog_text, Arguments::default(), false, true).unwrap();
+        let sm = compiled.source_map().unwrap();
+        assert!(
+            !sm.entries().is_empty(),
+            "Source map should have at least one entry for a non-trivial program"
+        );
+    }
+
+    #[test]
+    fn source_map_lines_within_source_range() {
+        let prog_text = "fn main() {\n    let ab: u16 = <(u8, u8)>::into((0x10, 0x01));\n    let c: u16 = 0x1001;\n    assert!(jet::eq_16(ab, c));\n}\n";
+        let line_count = prog_text.lines().count() as u32;
+        let compiled =
+            CompiledProgram::new(prog_text, Arguments::default(), false, true).unwrap();
+        let sm = compiled.source_map().unwrap();
+        for entry in sm.entries() {
+            assert!(
+                entry.start_line >= 1 && entry.start_line <= line_count,
+                "start_line {} out of range 1..={}",
+                entry.start_line,
+                line_count
+            );
+            assert!(
+                entry.end_line >= entry.start_line && entry.end_line <= line_count,
+                "end_line {} out of range {}..={}",
+                entry.end_line,
+                entry.start_line,
+                line_count
+            );
+            assert!(
+                entry.start_col >= 1,
+                "start_col {} should be >= 1",
+                entry.start_col
+            );
+            assert!(
+                entry.end_col >= 1,
+                "end_col {} should be >= 1",
+                entry.end_col
+            );
+        }
+    }
+
+    #[test]
+    fn source_map_node_indices_are_unique() {
+        let prog_text = "fn main() {\n    let ab: u16 = <(u8, u8)>::into((0x10, 0x01));\n    let c: u16 = 0x1001;\n    assert!(jet::eq_16(ab, c));\n}\n";
+        let compiled =
+            CompiledProgram::new(prog_text, Arguments::default(), false, true).unwrap();
+        let sm = compiled.source_map().unwrap();
+        let indices: Vec<usize> = sm.entries().iter().map(|e| e.node_index).collect();
+        let mut deduped = indices.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(
+            indices.len(),
+            deduped.len(),
+            "Source map node indices should be unique"
+        );
+    }
+
+    #[test]
+    fn source_map_json_roundtrip() {
+        let prog_text = "fn main() {\n    let x: u8 = 42;\n}\n";
+        let compiled =
+            CompiledProgram::new(prog_text, Arguments::default(), false, true).unwrap();
+        let sm = compiled.source_map().unwrap();
+        let json = sm.to_map_json("test.simf");
+        // Basic structural checks on the JSON output
+        assert!(json.contains("\"version\": 1"));
+        assert!(json.contains("\"sourceFile\": \"test.simf\""));
+        assert!(json.contains("\"nodes\""));
+        assert!(!json.contains("\"groups\""));
     }
 
     #[test]

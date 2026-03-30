@@ -10,6 +10,7 @@ use simplicity::Cmr;
 use simplicity::{types, FailEntropy};
 
 use crate::error::Span;
+use crate::source_map::NodeMeta;
 use crate::str::WitnessName;
 use crate::value::StructuralValue;
 use crate::witness::WitnessValues;
@@ -84,13 +85,17 @@ pub fn finalize_types<J: Jet>(
 /// the [`Span`] of the SimplicityHL expression that produced it. During the post-order traversal
 /// the same index is assigned to each [`CommitNode`] as to the corresponding [`ConstructNode`],
 /// so the returned map can be used to annotate the encoded program with source locations.
-pub fn finalize_types_with_source_map<J: Jet>(
+pub(crate) fn finalize_types_with_source_map<J: Jet>(
     node: &ConstructNode<J>,
     span_annotations: &HashMap<usize, Span>,
-) -> Result<(Arc<CommitNode<J>>, HashMap<usize, Span>), types::Error> {
+) -> Result<(Arc<CommitNode<J>>, HashMap<usize, NodeMeta>), types::Error> {
     struct AnnotatingTranslator<'a, J: Jet> {
         span_annotations: &'a HashMap<usize, Span>,
         index_to_span: HashMap<usize, Span>,
+        /// child index → parent index, built during the post-order traversal.
+        parent_of: HashMap<usize, usize>,
+        /// encoding index → Simplicity combinator name.
+        node_types: HashMap<usize, String>,
         _phantom: std::marker::PhantomData<J>,
     }
 
@@ -127,6 +132,15 @@ pub fn finalize_types_with_source_map<J: Jet>(
             if let Some(&span) = self.span_annotations.get(&ptr) {
                 self.index_to_span.insert(data.index, span);
             }
+            // Record parent relationships for child nodes.
+            if let Some(left) = data.left_index {
+                self.parent_of.insert(left, data.index);
+            }
+            if let Some(right) = data.right_index {
+                self.parent_of.insert(right, data.index);
+            }
+            // Record the node combinator type.
+            self.node_types.insert(data.index, format!("{}", inner));
             // Type finalisation — identical to finalize_types.
             let inner = inner
                 .map(|n| n.cached_data())
@@ -138,10 +152,56 @@ pub fn finalize_types_with_source_map<J: Jet>(
     let mut translator = AnnotatingTranslator {
         span_annotations,
         index_to_span: HashMap::new(),
+        parent_of: HashMap::new(),
+        node_types: HashMap::new(),
         _phantom: std::marker::PhantomData,
     };
     let commit = node.convert::<InternalSharing, _, _>(&mut translator)?;
-    Ok((commit, translator.index_to_span))
+
+    // For every node without a direct annotation, walk up the parent chain
+    // and inherit the span of the nearest annotated ancestor.
+    let all_indices: Vec<usize> = translator
+        .parent_of
+        .keys()
+        .copied()
+        .chain(translator.parent_of.values().copied())
+        .collect::<std::collections::HashSet<usize>>()
+        .into_iter()
+        .collect();
+    let index_to_span = &translator.index_to_span;
+    let parent_of = &translator.parent_of;
+    let mut filled_spans: HashMap<usize, Span> = index_to_span.clone();
+    for idx in &all_indices {
+        if filled_spans.contains_key(idx) {
+            continue;
+        }
+        let mut cur = *idx;
+        while let Some(&parent) = parent_of.get(&cur) {
+            if let Some(&span) = index_to_span.get(&parent) {
+                filled_spans.insert(*idx, span);
+                break;
+            }
+            cur = parent;
+        }
+    }
+
+    // Build the final NodeMeta map.
+    let mut node_metas: HashMap<usize, NodeMeta> = HashMap::new();
+    for (idx, span) in filled_spans {
+        node_metas.insert(
+            idx,
+            NodeMeta {
+                span,
+                node_type: translator
+                    .node_types
+                    .remove(&idx)
+                    .unwrap_or_default(),
+                parent_index: translator.parent_of.get(&idx).copied(),
+            },
+        );
+    }
+
+    Ok((commit, node_metas))
 }
 
 fn translate<M, N, F, E>(
