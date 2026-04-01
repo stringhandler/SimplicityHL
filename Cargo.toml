@@ -25,7 +25,7 @@ serde = ["dep:serde", "dep:serde_json"]
 base64 = "0.21.2"
 serde = { version = "1.0.188", features = ["derive"], optional = true }
 serde_json = { version = "1.0.105", optional = true }
-simplicity-lang = { version = "0.7.0" }
+simplicity-lang = { path = "E:/projects/rust-simplicity" }
 miniscript = "12.3.1"
 either = "1.12.0"
 itertools = "0.13.0"
