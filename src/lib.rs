@@ -21,6 +21,7 @@ pub mod types;
 pub mod value;
 mod witness;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use simplicity::jet::elements::ElementsEnv;
@@ -99,8 +100,16 @@ impl TemplateProgram {
             .compile(arguments, include_debug_symbols, include_source_map)
             .with_file(Arc::clone(&self.file))?;
 
-        let source_map = opt_node_metas
-            .map(|node_metas| SourceMap::new(node_metas, self.file.as_ref()));
+        let source_map = opt_node_metas.map(|node_metas| {
+            let mut sm = SourceMap::new(node_metas, self.file.as_ref());
+            // The source map entries use InternalSharing post-order indices
+            // (from the ConstructNode→CommitNode conversion). The effects analysis
+            // uses MaxSharing post-order indices. Populate the MaxSharing index on
+            // each entry so lookups from the effects analysis work correctly.
+            let is_to_ms = build_is_to_ms_index_map(&commit);
+            sm.populate_max_sharing_indices(&is_to_ms);
+            sm
+        });
 
         Ok(CompiledProgram {
             debug_symbols: self.simfony.debug_symbols(self.file.as_ref()),
@@ -117,6 +126,48 @@ impl TemplateProgram {
             param_types: self.parameters().shallow_clone(),
         })
     }
+}
+
+/// Build a mapping from InternalSharing post-order indices to MaxSharing
+/// post-order indices for the given named commit node.
+fn build_is_to_ms_index_map(
+    commit: &Arc<named::CommitNode<Elements>>,
+) -> HashMap<usize, usize> {
+    use simplicity::dag::{DagLike, InternalSharing, MaxSharing};
+    use simplicity::node::Commit;
+
+    use crate::named::WithNames;
+
+    type N = WithNames<Commit<Elements>>;
+
+    // Step 1: MaxSharing iteration — build ptr→ms_index and sharing_id→ms_index.
+    let mut ptr_to_ms: HashMap<usize, usize> = HashMap::new();
+    let mut sid_to_ms: HashMap<<N as simplicity::node::Marker>::SharingId, usize> = HashMap::new();
+    for item in commit.as_ref().post_order_iter::<MaxSharing<N>>() {
+        let ptr = item.node as *const _ as usize;
+        ptr_to_ms.insert(ptr, item.index);
+        if let Some(sid) = item.node.sharing_id() {
+            sid_to_ms.insert(sid, item.index);
+        }
+    }
+
+    // Step 2: InternalSharing iteration — map each IS index to its MS index.
+    let mut is_to_ms: HashMap<usize, usize> = HashMap::new();
+    for item in commit.as_ref().post_order_iter::<InternalSharing>() {
+        let ptr = item.node as *const _ as usize;
+        let ms_index = if let Some(&idx) = ptr_to_ms.get(&ptr) {
+            idx
+        } else if let Some(sid) = item.node.sharing_id() {
+            *sid_to_ms
+                .get(&sid)
+                .expect("node with sharing_id must have been visited by MaxSharing")
+        } else {
+            panic!("node without sharing_id must appear in MaxSharing iteration")
+        };
+        is_to_ms.insert(item.index, ms_index);
+    }
+
+    is_to_ms
 }
 
 /// A SimplicityHL program, compiled to Simplicity.

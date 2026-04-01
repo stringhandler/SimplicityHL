@@ -255,7 +255,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("  and can each be replaced with a bare `unit` node:");
                 for p in &top_level {
                     eprintln!("  node #{}", p.node_index);
-                    if let Some(entry) = source_map.and_then(|sm| lookup_node(sm, p.node_index)) {
+                    if let Some(entry) = source_map.and_then(|sm| sm.lookup_by_max_sharing_index(p.node_index)) {
                         print_source_snippet(prog_file, &prog_text, entry);
                     }
                 }

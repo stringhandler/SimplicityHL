@@ -22,8 +22,14 @@ pub struct SourceMap {
 /// A mapping from a single Simplicity encoding index to a source location.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceMapEntry {
-    /// Position of the node in the post-order (encoding-order) enumeration of the Simplicity DAG.
+    /// Position of the node in the post-order (encoding-order / InternalSharing) enumeration
+    /// of the Simplicity DAG.
     pub node_index: usize,
+    /// Position of the node in the MaxSharing post-order enumeration, used by the effects
+    /// analysis. Multiple entries may share the same `max_sharing_index` when MaxSharing
+    /// deduplicates nodes that InternalSharing keeps separate.
+    /// `None` until [`SourceMap::populate_max_sharing_indices`] is called.
+    pub max_sharing_index: Option<usize>,
     /// The Simplicity combinator type of this node (e.g. "comp", "pair", "jet(eq_16)").
     pub node_type: String,
     /// Encoding index of this node's parent in the DAG, if any.
@@ -48,6 +54,7 @@ impl SourceMap {
                     span_to_location(meta.span, source);
                 SourceMapEntry {
                     node_index,
+                    max_sharing_index: None,
                     node_type: meta.node_type,
                     parent_index: meta.parent_index,
                     start_line,
@@ -64,6 +71,21 @@ impl SourceMap {
     /// Access the individual node entries, sorted by encoding index.
     pub fn entries(&self) -> &[SourceMapEntry] {
         &self.entries
+    }
+
+    /// Populate the `max_sharing_index` field on each entry using a mapping
+    /// from InternalSharing index to MaxSharing index.
+    pub fn populate_max_sharing_indices(&mut self, is_to_ms: &HashMap<usize, usize>) {
+        for entry in &mut self.entries {
+            entry.max_sharing_index = is_to_ms.get(&entry.node_index).copied();
+        }
+    }
+
+    /// Find the first entry whose `max_sharing_index` matches the given value.
+    pub fn lookup_by_max_sharing_index(&self, ms_index: usize) -> Option<&SourceMapEntry> {
+        self.entries
+            .iter()
+            .find(|e| e.max_sharing_index == Some(ms_index))
     }
 
     /// Parse a source map from a `.map` JSON string produced by [`Self::to_map_json`].
@@ -148,10 +170,15 @@ impl SourceMap {
                 Some(p) => format!("{p}"),
                 None => "null".to_string(),
             };
+            let ms_str = match entry.max_sharing_index {
+                Some(ms) => format!("{ms}"),
+                None => "null".to_string(),
+            };
             out.push_str(&format!(
-                "    {{\"index\": {}, \"type\": \"{}\", \"parent\": {}, \
+                "    {{\"index\": {}, \"max_sharing_index\": {}, \"type\": \"{}\", \"parent\": {}, \
                  \"start_line\": {}, \"start_col\": {}, \"end_line\": {}, \"end_col\": {}}}",
                 entry.node_index,
+                ms_str,
                 entry.node_type,
                 parent_str,
                 entry.start_line,
@@ -198,8 +225,11 @@ fn parse_node_entry(obj: &str) -> Option<SourceMapEntry> {
     let node_type = extract_json_string(obj, "\"type\"").unwrap_or_default();
     let parent_index = extract_u64(obj, "\"parent\"").map(|v| v as usize);
 
+    let max_sharing_index = extract_u64(obj, "\"max_sharing_index\"").map(|v| v as usize);
+
     Some(SourceMapEntry {
         node_index: extract_u64(obj, "\"index\"")? as usize,
+        max_sharing_index,
         node_type,
         parent_index,
         start_line: extract_u64(obj, "\"start_line\"")? as u32,
