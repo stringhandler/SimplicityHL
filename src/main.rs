@@ -8,6 +8,7 @@ use simplicity::effects::{
 };
 use simplicityhl::source_map::{SourceMap, SourceMapEntry};
 use simplicityhl::{AbiMeta, CompiledProgram};
+use std::io::IsTerminal;
 use std::{env, fmt};
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
@@ -183,22 +184,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let source_map = compiled.source_map();
         let universe = TransactionField::all_elements();
 
-        let warn = "\x1b[1;33mwarning\x1b[0m";
-        let bold = "\x1b[1m";
-        let reset = "\x1b[0m";
+        let use_color = std::io::stderr().is_terminal();
+        let warn = if use_color { "\x1b[1;33mwarning\x1b[0m" } else { "warning" };
 
         // ── Root summary ────────────────────────────────────────────────
         let root_summary = summaries.last().expect("non-empty program");
-        eprintln!("{bold}=== Root summary ==={reset}");
-        eprintln!("  can_fail:  {}", if root_summary.can_fail { "yes" } else { "no" });
-        if root_summary.reads.is_empty() {
-            eprintln!("  reads:     (none)");
-        } else {
-            eprintln!("  reads:");
-            for field in &root_summary.reads {
-                eprintln!("    {}", field);
-            }
-        }
 
         if !root_summary.can_fail {
             eprintln!();
@@ -207,14 +197,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // ── Malleability ────────────────────────────────────────────────
         let mal = malleability_analysis(&summaries, &universe);
-        eprintln!();
-        eprintln!("{bold}=== Malleability (uncovered fields) ==={reset}");
-        if mal.uncovered.is_empty() {
-            eprintln!("  (none — all fields are covered)");
-        } else {
-            for field in &mal.uncovered {
-                eprintln!("  {}", field);
-            }
+        if !mal.uncovered.is_empty() {
+            let n = mal.uncovered.len();
+            eprintln!();
+            eprintln!(
+                "{warn}: {n} transaction field{} not read by any code path and {} therefore malleable",
+                if n == 1 { " is" } else { "s are" },
+                if n == 1 { "is" } else { "are" },
+            );
+            eprintln!("  If this contract is meant to be called by anyone (e.g. a vault timeout),");
+            eprintln!("  this may be acceptable. Otherwise, consider signing all fields with");
+            eprintln!("  `jet::bip_0340_verify` over `jet::sig_all_hash()`.");
+            let fields: Vec<String> = mal.uncovered.iter().map(|f| format!("{f}")).collect();
+            eprintln!();
+            eprintln!("  malleable fields: {}", fields.join(", "));
         }
 
         // ── Pruneable subtrees ──────────────────────────────────────────
@@ -228,6 +224,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut subsumed: std::collections::HashSet<usize> =
                 std::collections::HashSet::new();
             let mut bare_units: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
+            let mut drop_iden: std::collections::HashSet<usize> =
                 std::collections::HashSet::new();
             for item in (&*commit)
                 .post_order_iter::<MaxSharing<simplicity::node::Commit<simplicity::jet::Elements>>>()
@@ -243,11 +241,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if matches!(item.node.inner(), Inner::Unit) {
                     bare_units.insert(item.index);
                 }
+                // drop(iden) is compiler-generated sequencing plumbing;
+                // when the environment type is Unit these are flagged as
+                // pure-unit but are not user-actionable.
+                if let Inner::Drop(child) = item.node.inner() {
+                    if matches!(child.inner(), Inner::Iden) {
+                        drop_iden.insert(item.index);
+                    }
+                }
             }
             let top_level: Vec<_> = pruneable
                 .iter()
                 .filter(|p| !subsumed.contains(&p.node_index))
                 .filter(|p| !bare_units.contains(&p.node_index))
+                .filter(|p| !drop_iden.contains(&p.node_index))
                 .collect();
             if !top_level.is_empty() {
                 eprintln!();
@@ -264,18 +271,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // ── Code path analysis ──────────────────────────────────────────
         let (paths, truncated) = enumerate_code_paths(&commit, 64);
-        let with_write = paths.iter().filter(|p| p.can_fail).count();
-        let without_write = paths.len() - with_write;
-        eprintln!();
-        eprintln!("{bold}=== Code path analysis ==={reset}");
-        eprintln!(
-            "  {} path(s) total{}: {} with write effects, {} without",
-            paths.len(),
-            if truncated { " (truncated)" } else { "" },
-            with_write,
-            without_write,
-        );
-        for (i, path) in paths.iter().enumerate() {
+        let weak_paths: Vec<_> = paths
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !p.can_fail)
+            .collect();
+
+        for (i, path) in &weak_paths {
             let choices: Vec<String> = path
                 .choices
                 .iter()
@@ -292,33 +294,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 choices.join(", ")
             };
-            let reads = if path.reads.is_empty() {
-                "no reads".to_owned()
-            } else {
-                format!("reads {} fields", path.reads.len())
-            };
-            let fail = if path.can_fail { "can fail" } else { "cannot fail" };
-            let no_write = if !path.can_fail { " << NO WRITE EFFECT" } else { "" };
-            let path_uncovered: Vec<_> = universe.difference(&path.reads).collect();
             eprintln!();
-            eprintln!("  Path {}: {}", i + 1, path_label);
-            eprintln!("    {}, {}{}", reads, fail, no_write);
-            if path_uncovered.len() < universe.len() && !path_uncovered.is_empty() {
-                eprintln!("    uncovered fields ({}):", path_uncovered.len());
-                for field in &path_uncovered {
-                    eprintln!("      {}", field);
-                }
-            } else if path_uncovered.is_empty() {
-                eprintln!("    all fields covered");
-            } else {
-                eprintln!("    no fields covered (reads nothing)");
-            }
-            // Show source for branch choices on paths without write effects.
-            if !path.can_fail {
-                for (idx, _arm) in &path.choices {
-                    if let Some(entry) = source_map.and_then(|sm| lookup_node(sm, *idx)) {
-                        print_source_snippet(prog_file, &prog_text, entry);
-                    }
+            eprintln!(
+                "{warn}: path {} of {}{} has no failure effect — it accepts all inputs unconditionally",
+                i + 1,
+                paths.len(),
+                if truncated { " (truncated)" } else { "" },
+            );
+            eprintln!("  branches: {path_label}");
+            for (idx, _arm) in &path.choices {
+                if let Some(entry) = source_map.and_then(|sm| lookup_node(sm, *idx)) {
+                    print_source_snippet(prog_file, &prog_text, entry);
                 }
             }
         }
@@ -420,8 +406,9 @@ fn lookup_node(source_map: &SourceMap, node_index: usize) -> Option<&SourceMapEn
 }
 
 fn print_source_snippet(file: &str, source: &str, entry: &SourceMapEntry) {
-    let blue = "\x1b[1;34m";
-    let reset = "\x1b[0m";
+    let use_color = std::io::stderr().is_terminal();
+    let blue = if use_color { "\x1b[1;34m" } else { "" };
+    let reset = if use_color { "\x1b[0m" } else { "" };
     let lines: Vec<&str> = source.lines().collect();
 
     eprintln!(

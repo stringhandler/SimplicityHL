@@ -1,0 +1,15 @@
+fn main() {
+    match witness::ACTION {
+        Left(a: u8)=> {
+            panic!()
+        },
+        Right(a: u8) => {
+            // This is intentionally trivial. The compiler should generate a warning 
+            // stating that a branch has no failure/check logic.
+            let x: u8 = 1;
+            let y: u8 = 2;
+
+            let (carry, sum) : (bool, u8) = jet::add_8(x, y);
+        }
+    }   
+}

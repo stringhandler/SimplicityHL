@@ -1,0 +1,9 @@
+
+// This example should not be used. It is strictly for testing. This
+// example can't fail, so should generate a warning saying so.
+fn main() {
+    let x: u8 = 1;
+    let y: u8 = 2;
+
+    let (carry, sum) : (bool, u8) = jet::add_8(x, y);
+}
