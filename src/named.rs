@@ -10,7 +10,7 @@ use simplicity::Cmr;
 use simplicity::{types, FailEntropy};
 
 use crate::error::Span;
-use crate::source_map::NodeMeta;
+use crate::source_map::{IhrSpanData, RawSpanMeta};
 use crate::str::WitnessName;
 use crate::value::StructuralValue;
 use crate::witness::WitnessValues;
@@ -79,16 +79,18 @@ pub fn finalize_types<J: Jet>(
     })
 }
 
-/// Like [`finalize_types`], but also builds a map from Simplicity encoding index to source span.
+/// Like [`finalize_types`], but also collects IHR-keyed source span data.
 ///
 /// Each entry in `span_annotations` maps the raw pointer of a [`ConstructNode`] (as `usize`) to
 /// the [`Span`] of the SimplicityHL expression that produced it. During the post-order traversal
-/// the same index is assigned to each [`CommitNode`] as to the corresponding [`ConstructNode`],
-/// so the returned map can be used to annotate the encoded program with source locations.
+/// the same index is assigned to each [`CommitNode`] as to the corresponding [`ConstructNode`].
+///
+/// Returns the commit node and a list of `(ihr_hex, spans)` grouped by IHR in IS encounter order.
+/// Nodes without an IHR (witness/disconnect ancestors) are omitted.
 pub(crate) fn finalize_types_with_source_map<J: Jet>(
     node: &ConstructNode<J>,
     span_annotations: &HashMap<usize, Span>,
-) -> Result<(Arc<CommitNode<J>>, HashMap<usize, NodeMeta>), types::Error> {
+) -> Result<(Arc<CommitNode<J>>, IhrSpanData), types::Error> {
     struct AnnotatingTranslator<'a, J: Jet> {
         span_annotations: &'a HashMap<usize, Span>,
         index_to_span: HashMap<usize, Span>,
@@ -96,6 +98,10 @@ pub(crate) fn finalize_types_with_source_map<J: Jet>(
         parent_of: HashMap<usize, usize>,
         /// encoding index → Simplicity combinator name.
         node_types: HashMap<usize, String>,
+        /// encoding index → IHR hex string (only for nodes with an IHR).
+        index_to_ihr: HashMap<usize, String>,
+        /// IS post-order indices in encounter order.
+        is_order: Vec<usize>,
         _phantom: std::marker::PhantomData<J>,
     }
 
@@ -141,11 +147,18 @@ pub(crate) fn finalize_types_with_source_map<J: Jet>(
             }
             // Record the node combinator type.
             self.node_types.insert(data.index, format!("{}", inner));
+            // Track IS encounter order.
+            self.is_order.push(data.index);
             // Type finalisation — identical to finalize_types.
             let inner = inner
                 .map(|n| n.cached_data())
                 .map_witness(|_| &NoWitness);
-            node::CommitData::new(data.node.cached_data().arrow(), inner).map(Arc::new)
+            let commit_data = node::CommitData::new(data.node.cached_data().arrow(), inner)?;
+            // Record IHR if available.
+            if let Some(ihr) = commit_data.ihr() {
+                self.index_to_ihr.insert(data.index, ihr.to_string());
+            }
+            Ok(Arc::new(commit_data))
         }
     }
 
@@ -154,6 +167,8 @@ pub(crate) fn finalize_types_with_source_map<J: Jet>(
         index_to_span: HashMap::new(),
         parent_of: HashMap::new(),
         node_types: HashMap::new(),
+        index_to_ihr: HashMap::new(),
+        is_order: Vec::new(),
         _phantom: std::marker::PhantomData,
     };
     let commit = node.convert::<InternalSharing, _, _>(&mut translator)?;
@@ -185,23 +200,36 @@ pub(crate) fn finalize_types_with_source_map<J: Jet>(
         }
     }
 
-    // Build the final NodeMeta map.
-    let mut node_metas: HashMap<usize, NodeMeta> = HashMap::new();
-    for (idx, span) in filled_spans {
-        node_metas.insert(
-            idx,
-            NodeMeta {
-                span,
-                node_type: translator
-                    .node_types
-                    .remove(&idx)
-                    .unwrap_or_default(),
-                parent_index: translator.parent_of.get(&idx).copied(),
-            },
-        );
+    // Group by IHR in IS encounter order.
+    // Use an IndexMap-like approach: track insertion order via a Vec of IHR keys,
+    // with a HashMap for O(1) lookup into the result Vec.
+    let mut ihr_to_idx: HashMap<String, usize> = HashMap::new();
+    let mut result: Vec<(String, Vec<Option<RawSpanMeta>>)> = Vec::new();
+
+    for is_idx in &translator.is_order {
+        let Some(ihr) = translator.index_to_ihr.get(is_idx) else {
+            continue; // Skip nodes without IHR (witness/disconnect ancestors).
+        };
+
+        let opt_meta = filled_spans.get(is_idx).map(|&span| RawSpanMeta {
+            span,
+            node_type: translator
+                .node_types
+                .get(is_idx)
+                .cloned()
+                .unwrap_or_default(),
+        });
+
+        if let Some(&result_idx) = ihr_to_idx.get(ihr) {
+            result[result_idx].1.push(opt_meta);
+        } else {
+            let result_idx = result.len();
+            ihr_to_idx.insert(ihr.clone(), result_idx);
+            result.push((ihr.clone(), vec![opt_meta]));
+        }
     }
 
-    Ok((commit, node_metas))
+    Ok((commit, IhrSpanData(result)))
 }
 
 fn translate<M, N, F, E>(

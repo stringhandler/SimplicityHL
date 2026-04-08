@@ -286,7 +286,7 @@ impl Program {
         arguments: Arguments,
         include_debug_symbols: bool,
         include_source_map: bool,
-    ) -> Result<(Arc<named::CommitNode<Elements>>, Option<HashMap<usize, crate::source_map::NodeMeta>>), RichError> {
+    ) -> Result<(Arc<named::CommitNode<Elements>>, Option<crate::source_map::IhrSpanData>), RichError> {
         types::Context::with_context(|ctx| {
             let span_annotations = if include_source_map {
                 Some(Arc::new(RefCell::new(HashMap::<usize, Span>::new())))

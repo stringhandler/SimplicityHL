@@ -6,7 +6,7 @@ use simplicity::effects::{
     annotate_commit, enumerate_code_paths, malleability_analysis, pruneable_nodes, BranchArm,
     TransactionField,
 };
-use simplicityhl::source_map::{SourceMap, SourceMapEntry};
+use simplicityhl::source_map::{SourceMap, SourceSpan};
 use simplicityhl::{AbiMeta, CompiledProgram};
 use std::io::IsTerminal;
 use std::{env, fmt};
@@ -213,43 +213,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("  malleable fields: {}", fields.join(", "));
         }
 
-        // ── Pruneable subtrees ──────────────────────────────────────────
-        let pruneable = pruneable_nodes(&summaries);
-        if !pruneable.is_empty() {
-            use simplicity::dag::{DagLike, MaxSharing};
-            use simplicity::node::Inner;
+        // ── MaxSharing walk: collect node metadata for warnings ─────────
+        // Build ms_index → IHR string map and collect pruneable/unit/drop-iden info.
+        use simplicity::dag::{DagLike, MaxSharing};
+        use simplicity::node::Inner;
 
-            let pruneable_set: std::collections::HashSet<usize> =
-                pruneable.iter().map(|p| p.node_index).collect();
-            let mut subsumed: std::collections::HashSet<usize> =
-                std::collections::HashSet::new();
-            let mut bare_units: std::collections::HashSet<usize> =
-                std::collections::HashSet::new();
-            let mut drop_iden: std::collections::HashSet<usize> =
-                std::collections::HashSet::new();
-            for item in (&*commit)
-                .post_order_iter::<MaxSharing<simplicity::node::Commit<simplicity::jet::Elements>>>()
-            {
-                if pruneable_set.contains(&item.index) {
-                    if let Some(l) = item.left_index {
-                        subsumed.insert(l);
-                    }
-                    if let Some(r) = item.right_index {
-                        subsumed.insert(r);
-                    }
+        let pruneable = pruneable_nodes(&summaries);
+        let pruneable_set: std::collections::HashSet<usize> =
+            pruneable.iter().map(|p| p.node_index).collect();
+        let mut subsumed: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        let mut bare_units: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        let mut drop_iden: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        let mut ms_to_ihr: std::collections::HashMap<usize, String> =
+            std::collections::HashMap::new();
+
+        for item in (&*commit)
+            .post_order_iter::<MaxSharing<simplicity::node::Commit<simplicity::jet::Elements>>>()
+        {
+            if pruneable_set.contains(&item.index) {
+                if let Some(l) = item.left_index {
+                    subsumed.insert(l);
                 }
-                if matches!(item.node.inner(), Inner::Unit) {
-                    bare_units.insert(item.index);
-                }
-                // drop(iden) is compiler-generated sequencing plumbing;
-                // when the environment type is Unit these are flagged as
-                // pure-unit but are not user-actionable.
-                if let Inner::Drop(child) = item.node.inner() {
-                    if matches!(child.inner(), Inner::Iden) {
-                        drop_iden.insert(item.index);
-                    }
+                if let Some(r) = item.right_index {
+                    subsumed.insert(r);
                 }
             }
+            if matches!(item.node.inner(), Inner::Unit) {
+                bare_units.insert(item.index);
+            }
+            // drop(iden) is compiler-generated sequencing plumbing;
+            // when the environment type is Unit these are flagged as
+            // pure-unit but are not user-actionable.
+            if let Inner::Drop(child) = item.node.inner() {
+                if matches!(child.inner(), Inner::Iden) {
+                    drop_iden.insert(item.index);
+                }
+            }
+            if let Some(ihr) = item.node.sharing_id() {
+                ms_to_ihr.insert(item.index, ihr.to_string());
+            }
+        }
+
+        // ── Pruneable subtrees ──────────────────────────────────────────
+        if !pruneable.is_empty() {
             let top_level: Vec<_> = pruneable
                 .iter()
                 .filter(|p| !subsumed.contains(&p.node_index))
@@ -262,8 +271,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("  and can each be replaced with a bare `unit` node:");
                 for p in &top_level {
                     eprintln!("  node #{}", p.node_index);
-                    if let Some(entry) = source_map.and_then(|sm| sm.lookup_by_max_sharing_index(p.node_index)) {
-                        print_source_snippet(prog_file, &prog_text, entry);
+                    if let Some(ihr) = ms_to_ihr.get(&p.node_index) {
+                        if let Some(span) = source_map.and_then(|sm| sm.lookup_by_ihr(ihr)) {
+                            print_source_snippet(prog_file, &prog_text, span);
+                        }
                     }
                 }
             }
@@ -303,8 +314,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             eprintln!("  branches: {path_label}");
             for (idx, _arm) in &path.choices {
-                if let Some(entry) = source_map.and_then(|sm| lookup_node(sm, *idx)) {
-                    print_source_snippet(prog_file, &prog_text, entry);
+                if let Some(ihr) = ms_to_ihr.get(idx) {
+                    if let Some(span) = source_map.and_then(|sm| sm.lookup_by_ihr(ihr)) {
+                        print_source_snippet(prog_file, &prog_text, span);
+                    }
                 }
             }
         }
@@ -397,15 +410,7 @@ fn run_annotate(matches: &clap::ArgMatches) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-fn lookup_node(source_map: &SourceMap, node_index: usize) -> Option<&SourceMapEntry> {
-    source_map
-        .entries()
-        .binary_search_by_key(&node_index, |e| e.node_index)
-        .ok()
-        .map(|i| &source_map.entries()[i])
-}
-
-fn print_source_snippet(file: &str, source: &str, entry: &SourceMapEntry) {
+fn print_source_snippet(file: &str, source: &str, span: &SourceSpan) {
     let use_color = std::io::stderr().is_terminal();
     let blue = if use_color { "\x1b[1;34m" } else { "" };
     let reset = if use_color { "\x1b[0m" } else { "" };
@@ -413,23 +418,23 @@ fn print_source_snippet(file: &str, source: &str, entry: &SourceMapEntry) {
 
     eprintln!(
         " {blue}-->{reset} {}:{}:{}",
-        file, entry.start_line, entry.start_col,
+        file, span.start_line, span.start_col,
     );
 
-    let gutter_width = format!("{}", entry.end_line).len();
+    let gutter_width = format!("{}", span.end_line).len();
     eprintln!(" {blue}{:>gutter_width$} |{reset}", "");
 
-    for line_num in entry.start_line..=entry.end_line {
+    for line_num in span.start_line..=span.end_line {
         if let Some(line) = lines.get((line_num - 1) as usize) {
             eprintln!(" {blue}{line_num:>gutter_width$} |{reset} {line}");
         }
     }
 
     // Underline the relevant span on the first line.
-    let start_col = entry.start_col as usize;
-    let end_col = if entry.start_line == entry.end_line {
-        entry.end_col as usize
-    } else if let Some(line) = lines.get((entry.start_line - 1) as usize) {
+    let start_col = span.start_col as usize;
+    let end_col = if span.start_line == span.end_line {
+        span.end_col as usize
+    } else if let Some(line) = lines.get((span.start_line - 1) as usize) {
         line.len() + 1
     } else {
         start_col + 1

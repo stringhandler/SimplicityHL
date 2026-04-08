@@ -21,7 +21,6 @@ pub mod types;
 pub mod value;
 mod witness;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use simplicity::jet::elements::ElementsEnv;
@@ -100,16 +99,8 @@ impl TemplateProgram {
             .compile(arguments, include_debug_symbols, include_source_map)
             .with_file(Arc::clone(&self.file))?;
 
-        let source_map = opt_node_metas.map(|node_metas| {
-            let mut sm = SourceMap::new(node_metas, self.file.as_ref());
-            // The source map entries use InternalSharing post-order indices
-            // (from the ConstructNode→CommitNode conversion). The effects analysis
-            // uses MaxSharing post-order indices. Populate the MaxSharing index on
-            // each entry so lookups from the effects analysis work correctly.
-            let is_to_ms = build_is_to_ms_index_map(&commit);
-            sm.populate_max_sharing_indices(&is_to_ms);
-            sm
-        });
+        let source_map: Option<SourceMap> = opt_node_metas
+            .map(|ihr_spans| SourceMap::new(ihr_spans, self.file.as_ref()));
 
         Ok(CompiledProgram {
             debug_symbols: self.simfony.debug_symbols(self.file.as_ref()),
@@ -126,48 +117,6 @@ impl TemplateProgram {
             param_types: self.parameters().shallow_clone(),
         })
     }
-}
-
-/// Build a mapping from InternalSharing post-order indices to MaxSharing
-/// post-order indices for the given named commit node.
-fn build_is_to_ms_index_map(
-    commit: &Arc<named::CommitNode<Elements>>,
-) -> HashMap<usize, usize> {
-    use simplicity::dag::{DagLike, InternalSharing, MaxSharing};
-    use simplicity::node::Commit;
-
-    use crate::named::WithNames;
-
-    type N = WithNames<Commit<Elements>>;
-
-    // Step 1: MaxSharing iteration — build ptr→ms_index and sharing_id→ms_index.
-    let mut ptr_to_ms: HashMap<usize, usize> = HashMap::new();
-    let mut sid_to_ms: HashMap<<N as simplicity::node::Marker>::SharingId, usize> = HashMap::new();
-    for item in commit.as_ref().post_order_iter::<MaxSharing<N>>() {
-        let ptr = item.node as *const _ as usize;
-        ptr_to_ms.insert(ptr, item.index);
-        if let Some(sid) = item.node.sharing_id() {
-            sid_to_ms.insert(sid, item.index);
-        }
-    }
-
-    // Step 2: InternalSharing iteration — map each IS index to its MS index.
-    let mut is_to_ms: HashMap<usize, usize> = HashMap::new();
-    for item in commit.as_ref().post_order_iter::<InternalSharing>() {
-        let ptr = item.node as *const _ as usize;
-        let ms_index = if let Some(&idx) = ptr_to_ms.get(&ptr) {
-            idx
-        } else if let Some(sid) = item.node.sharing_id() {
-            *sid_to_ms
-                .get(&sid)
-                .expect("node with sharing_id must have been visited by MaxSharing")
-        } else {
-            panic!("node without sharing_id must appear in MaxSharing iteration")
-        };
-        is_to_ms.insert(item.index, ms_index);
-    }
-
-    is_to_ms
 }
 
 /// A SimplicityHL program, compiled to Simplicity.
@@ -580,46 +529,50 @@ pub(crate) mod tests {
             CompiledProgram::new(prog_text, Arguments::default(), false, true).unwrap();
         let sm = compiled.source_map().unwrap();
         for entry in sm.entries() {
-            assert!(
-                entry.start_line >= 1 && entry.start_line <= line_count,
-                "start_line {} out of range 1..={}",
-                entry.start_line,
-                line_count
-            );
-            assert!(
-                entry.end_line >= entry.start_line && entry.end_line <= line_count,
-                "end_line {} out of range {}..={}",
-                entry.end_line,
-                entry.start_line,
-                line_count
-            );
-            assert!(
-                entry.start_col >= 1,
-                "start_col {} should be >= 1",
-                entry.start_col
-            );
-            assert!(
-                entry.end_col >= 1,
-                "end_col {} should be >= 1",
-                entry.end_col
-            );
+            for opt_span in &entry.spans {
+                if let Some(span) = opt_span {
+                    assert!(
+                        span.start_line >= 1 && span.start_line <= line_count,
+                        "start_line {} out of range 1..={}",
+                        span.start_line,
+                        line_count
+                    );
+                    assert!(
+                        span.end_line >= span.start_line && span.end_line <= line_count,
+                        "end_line {} out of range {}..={}",
+                        span.end_line,
+                        span.start_line,
+                        line_count
+                    );
+                    assert!(
+                        span.start_col >= 1,
+                        "start_col {} should be >= 1",
+                        span.start_col
+                    );
+                    assert!(
+                        span.end_col >= 1,
+                        "end_col {} should be >= 1",
+                        span.end_col
+                    );
+                }
+            }
         }
     }
 
     #[test]
-    fn source_map_node_indices_are_unique() {
+    fn source_map_ihrs_are_unique() {
         let prog_text = "fn main() {\n    let ab: u16 = <(u8, u8)>::into((0x10, 0x01));\n    let c: u16 = 0x1001;\n    assert!(jet::eq_16(ab, c));\n}\n";
         let compiled =
             CompiledProgram::new(prog_text, Arguments::default(), false, true).unwrap();
         let sm = compiled.source_map().unwrap();
-        let indices: Vec<usize> = sm.entries().iter().map(|e| e.node_index).collect();
-        let mut deduped = indices.clone();
+        let ihrs: Vec<&str> = sm.entries().iter().map(|e| e.ihr.as_str()).collect();
+        let mut deduped = ihrs.clone();
         deduped.sort();
         deduped.dedup();
         assert_eq!(
-            indices.len(),
+            ihrs.len(),
             deduped.len(),
-            "Source map node indices should be unique"
+            "Source map IHR keys should be unique"
         );
     }
 
@@ -630,11 +583,11 @@ pub(crate) mod tests {
             CompiledProgram::new(prog_text, Arguments::default(), false, true).unwrap();
         let sm = compiled.source_map().unwrap();
         let json = sm.to_map_json("test.simf");
-        // Basic structural checks on the JSON output
-        assert!(json.contains("\"version\": 1"));
+        assert!(json.contains("\"version\": 2"));
         assert!(json.contains("\"sourceFile\": \"test.simf\""));
         assert!(json.contains("\"nodes\""));
-        assert!(!json.contains("\"groups\""));
+        assert!(json.contains("\"ihr\""));
+        assert!(json.contains("\"spans\""));
     }
 
     #[test]
