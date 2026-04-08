@@ -5,6 +5,7 @@ pub mod ast;
 pub mod compile;
 pub mod debug;
 pub mod dummy_env;
+pub mod effects;
 pub mod error;
 pub mod jet;
 pub mod lexer;
@@ -197,6 +198,14 @@ impl CompiledProgram {
             simplicity: simplicity_redeem,
             debug_symbols: self.debug_symbols.clone(),
         })
+    }
+
+    /// Run all effects analyses (malleability, pruneable nodes, weak code paths).
+    ///
+    /// Source locations are attached to results when a source map is available.
+    pub fn analyse_effects(&self) -> effects::EffectsAnalysis {
+        let commit = self.commit();
+        effects::analyse(&commit, self.source_map())
     }
 
     pub fn generate_abi_meta(&self) -> Result<AbiMeta, String> {

@@ -2,10 +2,6 @@ use base64::display::Base64Display;
 use base64::engine::general_purpose::STANDARD;
 use clap::{Arg, ArgAction, Command};
 
-use simplicity::effects::{
-    annotate_commit, enumerate_code_paths, malleability_analysis, pruneable_nodes, BranchArm,
-    TransactionField,
-};
 use simplicityhl::source_map::{SourceMap, SourceSpan};
 use simplicityhl::{AbiMeta, CompiledProgram};
 use std::io::IsTerminal;
@@ -179,26 +175,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Effects analysis ────────────────────────────────────────────────────
     {
-        let commit = compiled.commit();
-        let summaries = annotate_commit(&commit);
-        let source_map = compiled.source_map();
-        let universe = TransactionField::all_elements();
+        let analysis = compiled.analyse_effects();
 
         let use_color = std::io::stderr().is_terminal();
         let warn = if use_color { "\x1b[1;33mwarning\x1b[0m" } else { "warning" };
 
-        // ── Root summary ────────────────────────────────────────────────
-        let root_summary = summaries.last().expect("non-empty program");
-
-        if !root_summary.can_fail {
+        if !analysis.has_failure_path {
             eprintln!();
             eprintln!("{warn}: program has no failure path — it accepts all inputs unconditionally");
         }
 
-        // ── Malleability ────────────────────────────────────────────────
-        let mal = malleability_analysis(&summaries, &universe);
-        if !mal.uncovered.is_empty() {
-            let n = mal.uncovered.len();
+        if !analysis.malleable_fields.is_empty() {
+            let n = analysis.malleable_fields.len();
             eprintln!();
             eprintln!(
                 "{warn}: {n} transaction field{} not read by any code path and {} therefore malleable",
@@ -208,117 +196,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("  If this contract is meant to be called by anyone (e.g. a vault timeout),");
             eprintln!("  this may be acceptable. Otherwise, consider signing all fields with");
             eprintln!("  `jet::bip_0340_verify` over `jet::sig_all_hash()`.");
-            let fields: Vec<String> = mal.uncovered.iter().map(|f| format!("{f}")).collect();
+            let fields: Vec<String> = analysis.malleable_fields.iter().map(|f| format!("{f}")).collect();
             eprintln!();
             eprintln!("  malleable fields: {}", fields.join(", "));
         }
 
-        // ── MaxSharing walk: collect node metadata for warnings ─────────
-        // Build ms_index → IHR string map and collect pruneable/unit/drop-iden info.
-        use simplicity::dag::{DagLike, MaxSharing};
-        use simplicity::node::Inner;
-
-        let pruneable = pruneable_nodes(&summaries);
-        let pruneable_set: std::collections::HashSet<usize> =
-            pruneable.iter().map(|p| p.node_index).collect();
-        let mut subsumed: std::collections::HashSet<usize> =
-            std::collections::HashSet::new();
-        let mut bare_units: std::collections::HashSet<usize> =
-            std::collections::HashSet::new();
-        let mut drop_iden: std::collections::HashSet<usize> =
-            std::collections::HashSet::new();
-        let mut ms_to_ihr: std::collections::HashMap<usize, String> =
-            std::collections::HashMap::new();
-
-        for item in (&*commit)
-            .post_order_iter::<MaxSharing<simplicity::node::Commit<simplicity::jet::Elements>>>()
-        {
-            if pruneable_set.contains(&item.index) {
-                if let Some(l) = item.left_index {
-                    subsumed.insert(l);
-                }
-                if let Some(r) = item.right_index {
-                    subsumed.insert(r);
-                }
-            }
-            if matches!(item.node.inner(), Inner::Unit) {
-                bare_units.insert(item.index);
-            }
-            // drop(iden) is compiler-generated sequencing plumbing;
-            // when the environment type is Unit these are flagged as
-            // pure-unit but are not user-actionable.
-            if let Inner::Drop(child) = item.node.inner() {
-                if matches!(child.inner(), Inner::Iden) {
-                    drop_iden.insert(item.index);
-                }
-            }
-            if let Some(ihr) = item.node.sharing_id() {
-                ms_to_ihr.insert(item.index, ihr.to_string());
-            }
-        }
-
-        // ── Pruneable subtrees ──────────────────────────────────────────
-        if !pruneable.is_empty() {
-            let top_level: Vec<_> = pruneable
-                .iter()
-                .filter(|p| !subsumed.contains(&p.node_index))
-                .filter(|p| !bare_units.contains(&p.node_index))
-                .filter(|p| !drop_iden.contains(&p.node_index))
-                .collect();
-            if !top_level.is_empty() {
-                eprintln!();
-                eprintln!("{warn}: {} pruneable subtree(s) have return type Unit with no side effects", top_level.len());
-                eprintln!("  and can each be replaced with a bare `unit` node:");
-                for p in &top_level {
-                    eprintln!("  node #{}", p.node_index);
-                    if let Some(ihr) = ms_to_ihr.get(&p.node_index) {
-                        if let Some(span) = source_map.and_then(|sm| sm.lookup_by_ihr(ihr)) {
-                            print_source_snippet(prog_file, &prog_text, span);
-                        }
-                    }
+        if !analysis.pruneable_nodes.is_empty() {
+            eprintln!();
+            eprintln!("{warn}: {} pruneable subtree(s) have return type Unit with no side effects", analysis.pruneable_nodes.len());
+            eprintln!("  and can each be replaced with a bare `unit` node:");
+            for p in &analysis.pruneable_nodes {
+                eprintln!("  node #{}", p.ms_index);
+                if let Some(span) = &p.source_span {
+                    print_source_snippet(prog_file, &prog_text, span);
                 }
             }
         }
 
-        // ── Code path analysis ──────────────────────────────────────────
-        let (paths, truncated) = enumerate_code_paths(&commit, 64);
-        let weak_paths: Vec<_> = paths
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| !p.can_fail)
-            .collect();
-
-        for (i, path) in &weak_paths {
-            let choices: Vec<String> = path
-                .choices
-                .iter()
-                .map(|(sid, arm)| {
-                    let arm_str = match arm {
-                        BranchArm::Left => "left",
-                        BranchArm::Right => "right",
-                    };
-                    format!("case #{sid} -> {arm_str}")
-                })
-                .collect();
-            let path_label = if choices.is_empty() {
-                "(no branches)".to_owned()
-            } else {
-                choices.join(", ")
-            };
+        for path in &analysis.weak_code_paths {
             eprintln!();
             eprintln!(
                 "{warn}: path {} of {}{} has no failure effect — it accepts all inputs unconditionally",
-                i + 1,
-                paths.len(),
-                if truncated { " (truncated)" } else { "" },
+                path.path_index + 1,
+                analysis.total_code_paths,
+                if analysis.code_paths_truncated { " (truncated)" } else { "" },
             );
-            eprintln!("  branches: {path_label}");
-            for (idx, _arm) in &path.choices {
-                if let Some(ihr) = ms_to_ihr.get(idx) {
-                    if let Some(span) = source_map.and_then(|sm| sm.lookup_by_ihr(ihr)) {
-                        print_source_snippet(prog_file, &prog_text, span);
-                    }
-                }
+            eprintln!("  branches: {}", path.label());
+            for span in &path.branch_spans {
+                print_source_snippet(prog_file, &prog_text, span);
             }
         }
     }
