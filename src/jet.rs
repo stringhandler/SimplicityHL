@@ -700,7 +700,13 @@ fn source_jet_classification(jet: Elements) -> SourceJetClassification {
         | Elements::IssuanceAssetProof
         | Elements::IssuanceTokenProof
         | Elements::IssuanceHash => SourceJetClassification::Unary,
-        Elements::OutputNullDatum => SourceJetClassification::Binary,
+        Elements::OutputNullDatum
+        | Elements::OutputNullGetBytes1
+        | Elements::OutputNullGetBytes2
+        | Elements::OutputNullGetBytes4
+        | Elements::OutputNullGetBytes16
+        | Elements::OutputNullGetBytes32
+        | Elements::OutputNullGetBytes64 => SourceJetClassification::Binary,
         Elements::TotalFee => SourceJetClassification::Custom(vec![ExplicitAsset.into()]),
         Elements::Tappath => SourceJetClassification::Unary,
     }
@@ -1225,6 +1231,12 @@ fn target_jet_classification(jet: Elements) -> TargetJetClassification {
             tuple([U2, U256]),
             either(U1, U4),
         )))),
+        Elements::OutputNullGetBytes1 => option(option(U8)),
+        Elements::OutputNullGetBytes2 => option(option(U16)),
+        Elements::OutputNullGetBytes4 => option(option(U32)),
+        Elements::OutputNullGetBytes16 => option(option(U128)),
+        Elements::OutputNullGetBytes32 => option(option(U256)),
+        Elements::OutputNullGetBytes64 => option(option(tuple([U256, U256]))),
         Elements::OutputIsFee => TargetJetClassification::Custom(option(bool())),
         Elements::TotalFee => TargetJetClassification::Custom(ExplicitAmount.into()),
         Elements::CurrentPrevOutpoint => TargetJetClassification::Custom(Outpoint.into()),
