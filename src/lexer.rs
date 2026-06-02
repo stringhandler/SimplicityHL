@@ -367,7 +367,7 @@ mod tests {
         use chumsky::prelude::*;
 
         // Check if the lexer parses the example file without errors.
-        let src = include_str!("../examples/last_will.simf");
+        let src = include_str!("../examples/deprecated/last_will.simf");
 
         let (tokens, lex_errs) = lexer().parse(src).into_output_errors();
         let _ = tokens.unwrap();

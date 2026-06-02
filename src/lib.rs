@@ -816,10 +816,10 @@ pub(crate) mod tests {
     #[test]
     #[cfg(feature = "serde")]
     fn escrow_with_delay_timeout() {
-        TestCase::program_file("./examples/escrow_with_delay.simf")
+        TestCase::program_file("./examples/deprecated/escrow_with_delay.simf")
             .with_sequence(1000)
             .print_sighash_all()
-            .with_witness_file("./examples/escrow_with_delay.timeout.wit")
+            .with_witness_file("./examples/deprecated/escrow_with_delay.timeout.wit")
             .assert_run_success();
     }
 
@@ -852,10 +852,10 @@ pub(crate) mod tests {
     #[test]
     #[cfg(feature = "serde")]
     fn last_will_inherit() {
-        TestCase::program_file("./examples/last_will.simf")
+        TestCase::program_file("./examples/deprecated/last_will.simf")
             .with_sequence(25920)
             .print_sighash_all()
-            .with_witness_file("./examples/last_will.inherit.wit")
+            .with_witness_file("./examples/deprecated/last_will.inherit.wit")
             .assert_run_success();
     }
 
@@ -890,10 +890,10 @@ pub(crate) mod tests {
     #[test]
     #[cfg(feature = "serde")]
     fn presigned_vault_complete() {
-        TestCase::program_file("./examples/presigned_vault.simf")
+        TestCase::program_file("./examples/deprecated/presigned_vault.simf")
             .with_sequence(1000)
             .print_sighash_all()
-            .with_witness_file("./examples/presigned_vault.complete.wit")
+            .with_witness_file("./examples/deprecated/presigned_vault.complete.wit")
             .assert_run_success();
     }
 
@@ -1034,6 +1034,10 @@ fn main() {
         }
 
         fn regression_test(name: &str) {
+            regression_test_in_dir(name, "examples");
+        }
+
+        fn regression_test_in_dir(name: &str, dir: &str) {
             let program = serde_json::from_str::<Program>(
                 std::fs::read_to_string(format!("./test-data/{}.json", name))
                     .unwrap()
@@ -1041,11 +1045,11 @@ fn main() {
             )
             .unwrap();
 
-            let test_case = TestCase::program_file(format!("./examples/{}.simf", name));
+            let test_case = TestCase::program_file(format!("./{dir}/{name}.simf"));
             match program.witness {
                 Some(wit) => {
                     let (new_program, new_witness) = test_case
-                        .with_witness_file(format!("./examples/{}.wit", name))
+                        .with_witness_file(format!("./{dir}/{name}.wit"))
                         .get_encoding_with_witness();
                     assert_eq!(
                         program.program, new_program,
@@ -1089,7 +1093,7 @@ fn main() {
 
         #[test]
         fn escrow_with_delay_regression() {
-            regression_test("escrow_with_delay");
+            regression_test_in_dir("escrow_with_delay", "examples/deprecated");
         }
 
         #[test]
@@ -1109,7 +1113,7 @@ fn main() {
 
         #[test]
         fn last_will_regression() {
-            regression_test("last_will");
+            regression_test_in_dir("last_will", "examples/deprecated");
         }
 
         #[test]
@@ -1129,7 +1133,7 @@ fn main() {
 
         #[test]
         fn presigned_vault_regression() {
-            regression_test("presigned_vault");
+            regression_test_in_dir("presigned_vault", "examples/deprecated");
         }
 
         #[test]
