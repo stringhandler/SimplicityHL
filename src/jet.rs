@@ -704,6 +704,7 @@ fn source_jet_classification(jet: Elements) -> SourceJetClassification {
         | Elements::OutputNullGetBytes1
         | Elements::OutputNullGetBytes2
         | Elements::OutputNullGetBytes4
+        | Elements::OutputNullGetBytes8
         | Elements::OutputNullGetBytes16
         | Elements::OutputNullGetBytes32
         | Elements::OutputNullGetBytes64 => SourceJetClassification::Binary,
@@ -1234,6 +1235,7 @@ fn target_jet_classification(jet: Elements) -> TargetJetClassification {
         Elements::OutputNullGetBytes1 => option(option(U8)),
         Elements::OutputNullGetBytes2 => option(option(U16)),
         Elements::OutputNullGetBytes4 => option(option(U32)),
+        Elements::OutputNullGetBytes8 => option(option(U64)),
         Elements::OutputNullGetBytes16 => option(option(U128)),
         Elements::OutputNullGetBytes32 => option(option(U256)),
         Elements::OutputNullGetBytes64 => option(option(tuple([U256, U256]))),
