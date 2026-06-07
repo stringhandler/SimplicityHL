@@ -1232,13 +1232,15 @@ fn target_jet_classification(jet: Elements) -> TargetJetClassification {
             tuple([U2, U256]),
             either(U1, U4),
         )))),
-        Elements::OutputNullGetBytes1 => option(option(U8)),
-        Elements::OutputNullGetBytes2 => option(option(U16)),
-        Elements::OutputNullGetBytes4 => option(option(U32)),
-        Elements::OutputNullGetBytes8 => option(option(U64)),
-        Elements::OutputNullGetBytes16 => option(option(U128)),
-        Elements::OutputNullGetBytes32 => option(option(U256)),
-        Elements::OutputNullGetBytes64 => option(option(tuple([U256, U256]))),
+        Elements::OutputNullGetBytes1 => TargetJetClassification::Custom(option(option(U8))),
+        Elements::OutputNullGetBytes2 => TargetJetClassification::Custom(option(option(U16))),
+        Elements::OutputNullGetBytes4 => TargetJetClassification::Custom(option(option(U32))),
+        Elements::OutputNullGetBytes8 => TargetJetClassification::Custom(option(option(U64))),
+        Elements::OutputNullGetBytes16 => TargetJetClassification::Custom(option(option(U128))),
+        Elements::OutputNullGetBytes32 => TargetJetClassification::Custom(option(option(U256))),
+        Elements::OutputNullGetBytes64 => {
+            TargetJetClassification::Custom(option(option(tuple([U256, U256]))))
+        }
         Elements::OutputIsFee => TargetJetClassification::Custom(option(bool())),
         Elements::TotalFee => TargetJetClassification::Custom(ExplicitAmount.into()),
         Elements::CurrentPrevOutpoint => TargetJetClassification::Custom(Outpoint.into()),
