@@ -67,3 +67,10 @@ path = "fuzz_targets/reconstruct_value.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "resolve_imports"
+path = "fuzz_targets/resolve_imports.rs"
+test = false
+doc = false
+bench = false
