@@ -33,6 +33,7 @@ pub struct Program {
     parameters: Parameters,
     witness_types: WitnessTypes,
     call_tracker: Arc<CallTracker>,
+    named_functions: HashMap<String, CustomFunction>,
 }
 
 impl Program {
@@ -61,6 +62,16 @@ impl Program {
     /// Access the tracker of function calls.
     pub(crate) fn call_tracker(&self) -> &Arc<CallTracker> {
         &self.call_tracker
+    }
+
+    /// Access all named custom functions defined in the main source file.
+    pub fn named_functions(&self) -> &HashMap<String, CustomFunction> {
+        &self.named_functions
+    }
+
+    /// Look up a named custom function by its plain string name.
+    pub fn named_function(&self, name: &str) -> Option<&CustomFunction> {
+        self.named_functions.get(name)
     }
 }
 
@@ -1146,6 +1157,25 @@ impl Scope {
         }
     }
 
+    /// Return a map of all custom functions defined in the main source file,
+    /// keyed by their plain string names (excluding `main`).
+    ///
+    /// Only functions whose definition appears in the root `.simf` file are
+    /// included. Functions imported from dependency files have a different
+    /// `file_id` and are intentionally excluded — callers that need a function
+    /// from an imported library must compile it via that library's own
+    /// `TemplateProgram`.
+    ///
+    /// Must be called before [`Self::destruct`].
+    pub fn collect_named_functions(&self) -> HashMap<String, CustomFunction> {
+        self.root
+            .functions
+            .iter()
+            .filter(|(name, _)| **name != FunctionName::main())
+            .map(|(name, (func, _visibility))| (name.as_inner().to_string(), func.clone()))
+            .collect()
+    }
+
     /// Consume the scope and return its contents:
     ///
     /// 1. The map of parameter types.
@@ -1232,6 +1262,7 @@ impl Program {
             "Unclosed module scopes remain"
         );
 
+        let named_functions = scope.collect_named_functions();
         let (parameters, witness_types, call_tracker) = scope.destruct();
         let main = Self::extract_single_main(&items)
             // If we find a duplicate of main function
@@ -1244,6 +1275,7 @@ impl Program {
             parameters,
             witness_types,
             call_tracker: Arc::new(call_tracker),
+            named_functions,
         })
     }
 

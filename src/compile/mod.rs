@@ -11,8 +11,8 @@ use simplicity::{types, Cmr, FailEntropy};
 use self::builtins::array_fold;
 use crate::array::{BTreeSlice, Partition};
 use crate::ast::{
-    Call, CallName, EnumMatch, Expression, ExpressionInner, JetHinter, Match, Program,
-    SingleExpression, SingleExpressionInner, Statement,
+    Call, CallName, CustomFunction, EnumMatch, Expression, ExpressionInner, JetHinter, Match,
+    Program, SingleExpression, SingleExpressionInner, Statement,
 };
 use crate::debug::CallTracker;
 use crate::error::{Diagnostic, Error, Span, WithSpan};
@@ -89,8 +89,30 @@ impl<'brand> Scope<'brand> {
         include_debug_symbols: bool,
         jet_hinter: Box<dyn JetHinter>,
     ) -> Self {
+        Self::with_input(
+            ctx,
+            call_tracker,
+            arguments,
+            include_debug_symbols,
+            jet_hinter,
+            Pattern::Ignore,
+        )
+    }
+
+    /// Create a root scope whose input type is given by `input` rather than unit.
+    ///
+    /// Use this when compiling a standalone function where the function arguments
+    /// become the Simplicity source type of the resulting combinator.
+    pub fn with_input(
+        ctx: simplicity::types::Context<'brand>,
+        call_tracker: Arc<CallTracker>,
+        arguments: Arguments,
+        include_debug_symbols: bool,
+        jet_hinter: Box<dyn JetHinter>,
+        input: Pattern,
+    ) -> Self {
         Self {
-            variables: vec![vec![Pattern::Ignore]],
+            variables: vec![vec![input]],
             ctx,
             call_tracker,
             arguments,
@@ -281,6 +303,41 @@ impl Program {
             // SimplicityHL types should be correct by construction. If not, assign the
             // whole main function as the span for them, which is as sensible as anything.
             named::finalize_types(&construct).with_span(main)
+        })
+    }
+
+    /// Compile a single named function as a standalone Simplicity combinator.
+    ///
+    /// The function's argument types become the source type of the resulting node,
+    /// and the function's return type becomes the target type. The compiled node
+    /// can be encoded as binary and called by a Simplicity bit machine that has
+    /// the appropriate input pre-loaded.
+    ///
+    /// ## Precondition
+    ///
+    /// The supplied `arguments` are consistent with the `param::` names referenced
+    /// in the function body.
+    pub fn compile_function(
+        &self,
+        function: &CustomFunction,
+        arguments: Arguments,
+        include_debug_symbols: bool,
+        jet_hinter: Box<dyn JetHinter>,
+    ) -> Result<Arc<named::CommitNode>, Diagnostic> {
+        types::Context::with_context(|ctx| {
+            let mut scope = Scope::with_input(
+                ctx,
+                Arc::clone(self.call_tracker()),
+                arguments,
+                include_debug_symbols,
+                jet_hinter,
+                function.params_pattern(),
+            );
+            let construct = function
+                .body()
+                .compile(&mut scope)
+                .map(PairBuilder::build)?;
+            named::finalize_types(&construct).with_span(function.body())
         })
     }
 }

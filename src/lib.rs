@@ -9,6 +9,7 @@ pub mod docs;
 pub mod driver;
 pub mod dummy_env;
 pub mod error;
+pub mod eval;
 pub mod jet;
 pub mod lexer;
 pub mod named;
@@ -42,10 +43,12 @@ pub use simplicity::elements;
 use crate::debug::DebugSymbols;
 use crate::driver::{DependencyGraph, SourceMap, MAIN_MODULE};
 use crate::error::DiagnosticManager;
+pub use crate::eval::{eval_expression, requires_transaction_context, EvalError};
 use crate::parse::ParseFromStrWithErrors;
 use crate::resolution::DependencyMap;
 use crate::source::CanonSourceFile;
 pub use crate::types::ResolvedType;
+use crate::types::TypeConstructible;
 pub use crate::unstable::{UnstableFeature, UnstableFeatures};
 pub use crate::value::Value;
 #[cfg(feature = "serde")]
@@ -243,7 +246,271 @@ impl TemplateProgram {
     pub fn resolved_program(&self) -> &parse::Program {
         &self.resolved_program
     }
+
+    /// Compile a single named function to a standalone Simplicity combinator and
+    /// return the binary encoding along with type information.
+    ///
+    /// The function's argument types become the Simplicity **source** type of the
+    /// resulting combinator, and the function's return type becomes the **target**
+    /// type. The encoded bytes can be passed to a Simplicity bit machine that has
+    /// the appropriate input pre-loaded.
+    ///
+    /// ## Parameters
+    ///
+    /// * `name` — the name of the function to compile. If `None`, the source must
+    ///   contain exactly one named function or an error is returned.
+    /// * `arguments` — values for every `param::NAME` referenced in the function
+    ///   body. Use [`Arguments::default`] if the function has no parameters.
+    ///
+    /// ## Errors
+    ///
+    /// * The named function does not exist.
+    /// * `name` is `None` and the source contains zero or more than one function.
+    /// * The function body fails to compile (type error, missing parameter, etc.).
+    pub fn compile_function(
+        &self,
+        name: Option<&str>,
+        arguments: Arguments,
+    ) -> Result<CompiledFunction, String> {
+        let function = match name {
+            Some(n) => self.simfony.named_function(n).ok_or_else(|| {
+                let available: Vec<&str> = self
+                    .simfony
+                    .named_functions()
+                    .keys()
+                    .map(String::as_str)
+                    .collect();
+                if available.is_empty() {
+                    format!("function `{n}` not found; no custom functions are defined")
+                } else {
+                    format!(
+                        "function `{n}` not found; available: {}",
+                        available.join(", ")
+                    )
+                }
+            })?,
+            None => {
+                let fns = self.simfony.named_functions();
+                match fns.len() {
+                    0 => return Err("no custom functions defined in the source".to_string()),
+                    1 => fns.values().next().unwrap(),
+                    _ => {
+                        let names: Vec<&str> = fns.keys().map(String::as_str).collect();
+                        return Err(format!(
+                            "multiple functions defined; specify a name: {}",
+                            names.join(", ")
+                        ));
+                    }
+                }
+            }
+        };
+
+        let params: Vec<(String, ResolvedType)> = function
+            .params()
+            .iter()
+            .map(|p| (p.identifier().as_inner().to_string(), p.ty().clone()))
+            .collect();
+
+        let source_type = {
+            let mut it = params.iter().rev().map(|(_, ty)| ty.clone());
+            match it.next() {
+                None => ResolvedType::unit(),
+                Some(last) => it.fold(last, |acc, ty| ResolvedType::product(ty, acc)),
+            }
+        };
+
+        let target_type = function.body().ty().clone();
+
+        let commit = self
+            .simfony
+            .compile_function(function, arguments, false, self.jet_hinter.clone_box())?;
+
+        let bytes = commit.to_vec_without_witness();
+        let cmr = commit.cmr();
+
+        Ok(CompiledFunction {
+            params,
+            source_type,
+            target_type,
+            bytes,
+            cmr,
+        })
+    }
+
+    /// Compile and immediately execute a named function.
+    ///
+    /// This is a convenience wrapper around [`Self::compile_function`] followed by
+    /// [`CompiledFunction::execute`]. See those methods for parameter and error details.
+    pub fn execute_function(
+        &self,
+        name: Option<&str>,
+        arguments: Arguments,
+        input: Value,
+    ) -> Result<Value, ExecuteFunctionError> {
+        let compiled = self
+            .compile_function(name, arguments)
+            .map_err(ExecuteFunctionError::ExecutionFailed)?;
+        compiled.execute(input)
+    }
 }
+
+/// A standalone Simplicity combinator compiled from a single SimplicityHL function.
+///
+/// The combinator's **source** type is the product of the function's parameter
+/// types (right-associative, matching SimplicityHL tuple layout). Its **target**
+/// type is the function's return type.
+///
+/// The binary encoding can be passed to a Simplicity bit machine that has the
+/// appropriate input value pre-loaded.
+#[derive(Clone, Debug)]
+pub struct CompiledFunction {
+    params: Vec<(String, ResolvedType)>,
+    source_type: ResolvedType,
+    target_type: ResolvedType,
+    bytes: Vec<u8>,
+    cmr: simplicity::Cmr,
+}
+
+impl CompiledFunction {
+    /// The function parameters as `(name, type)` pairs in declaration order.
+    pub fn params(&self) -> &[(String, ResolvedType)] {
+        &self.params
+    }
+
+    /// The Simplicity source type of the compiled combinator.
+    ///
+    /// This is the right-associative product of all parameter types, matching
+    /// SimplicityHL's tuple layout:
+    /// * 0 params → `()`
+    /// * 1 param  → `T`
+    /// * 2 params → `T1 × T2`
+    /// * 3 params → `T1 × (T2 × T3)`
+    pub fn source_type(&self) -> &ResolvedType {
+        &self.source_type
+    }
+
+    /// The Simplicity target type of the compiled combinator (the function's return type).
+    pub fn target_type(&self) -> &ResolvedType {
+        &self.target_type
+    }
+
+    /// The binary encoding of the combinator (without witness data).
+    pub fn encode(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The Commitment Merkle Root of the compiled combinator.
+    pub fn cmr(&self) -> simplicity::Cmr {
+        self.cmr
+    }
+
+    /// Execute this combinator with the given input value.
+    ///
+    /// The input must match `self.source_type()`. Returns the output value whose
+    /// type is `self.target_type()`. Uses a dummy Elements environment — the function
+    /// must not reference transaction-introspection jets.
+    pub fn execute(&self, input: Value) -> Result<Value, ExecuteFunctionError> {
+        use simplicity::node::{Inner, SimpleFinalizer};
+        use simplicity::BitMachine;
+
+        if input.ty() != self.source_type() {
+            return Err(ExecuteFunctionError::InputTypeMismatch {
+                expected: self.source_type().clone(),
+                got: input.ty().clone(),
+            });
+        }
+
+        // Decode the bytes back to a CommitNode.
+        // We use ConstructNode::decode + finalize_types_non_program (not CommitNode::decode)
+        // because CommitNode::decode imposes source=unit/target=unit (program constraints),
+        // while a standalone function has arbitrary source/target types.
+        let bits = simplicity::BitIter::from(self.bytes.iter().copied());
+        let commit: Arc<CommitNode> = simplicity::types::Context::with_context(|ctx| {
+            simplicity::ConstructNode::decode::<_, simplicity::jet::Elements>(&ctx, bits)
+                .map_err(|e| ExecuteFunctionError::ExecutionFailed(e.to_string()))
+                .and_then(|construct| {
+                    construct
+                        .finalize_types_non_program()
+                        .map_err(|e| ExecuteFunctionError::ExecutionFailed(e.to_string()))
+                })
+        })?;
+
+        // Scan for introspection jets before executing.
+        use simplicity::dag::DagLike as _;
+        for data in Arc::clone(&commit).post_order_iter::<simplicity::dag::NoSharing>() {
+            if let Inner::Jet(jet) = data.node.inner() {
+                if let Some(el_jet) = jet
+                    .as_ref()
+                    .as_any()
+                    .downcast_ref::<simplicity::jet::Elements>()
+                {
+                    if crate::eval::requires_transaction_context(*el_jet) {
+                        return Err(ExecuteFunctionError::ExecutionFailed(format!(
+                            "function references introspection jet `{el_jet:?}`; \
+                             pure functions must not use transaction-introspection jets"
+                        )));
+                    }
+                }
+            }
+        }
+
+        let redeem = commit
+            .finalize(&mut SimpleFinalizer::new(std::iter::empty::<
+                simplicity::Value,
+            >()))
+            .map_err(|e| ExecuteFunctionError::ExecutionFailed(e.to_string()))?;
+
+        // prune() requires source=unit (program-level) and would fail here because
+        // standalone functions have arbitrary source types.  The introspection-jet
+        // scan above already rejects functions that reference transaction jets, so
+        // we can safely execute on the unprüned RedeemNode.
+        let env = dummy_env::dummy();
+
+        let mut mac = BitMachine::for_program(&redeem)
+            .map_err(|e| ExecuteFunctionError::ExecutionFailed(e.to_string()))?;
+
+        let sim_input = simplicity::Value::from(crate::value::StructuralValue::from(&input));
+        mac.input(&sim_input)
+            .map_err(|e| ExecuteFunctionError::ExecutionFailed(e.to_string()))?;
+
+        let sim_output = mac
+            .exec(&redeem, &env)
+            .map_err(|e| ExecuteFunctionError::ExecutionFailed(e.to_string()))?;
+
+        let structural_output = crate::value::StructuralValue::from(sim_output);
+        Value::reconstruct(&structural_output, &self.target_type)
+            .ok_or(ExecuteFunctionError::NoOutput)
+    }
+}
+
+/// Error returned by [`CompiledFunction::execute`] and [`TemplateProgram::execute_function`].
+#[derive(Debug)]
+pub enum ExecuteFunctionError {
+    /// The supplied input value's type does not match the function's source type.
+    InputTypeMismatch {
+        expected: ResolvedType,
+        got: ResolvedType,
+    },
+    /// Compilation, pruning, or bit-machine execution failed.
+    ExecutionFailed(String),
+    /// Execution completed but produced no output value (should not occur for
+    /// well-typed functions).
+    NoOutput,
+}
+
+impl std::fmt::Display for ExecuteFunctionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExecuteFunctionError::InputTypeMismatch { expected, got } => {
+                write!(f, "input type mismatch: expected `{expected}`, got `{got}`")
+            }
+            ExecuteFunctionError::ExecutionFailed(msg) => write!(f, "execution failed: {msg}"),
+            ExecuteFunctionError::NoOutput => f.write_str("execution produced no output"),
+        }
+    }
+}
+
+impl std::error::Error for ExecuteFunctionError {}
 
 /// A SimplicityHL program, compiled to Simplicity.
 #[derive(Clone, Debug)]
@@ -1780,6 +2047,101 @@ fn main() {
                 .with_witness_values(WitnessValues::from(map))
                 .assert_run_success();
             }
+        }
+    }
+
+    #[test]
+    fn execute_function_add_one() {
+        use crate::value::ValueConstructible;
+
+        let source = r#"
+fn main() {}
+fn add_one(x: u32) -> u32 {
+    let (_carry, result): (bool, u32) = jet::add_32(x, 1);
+    result
+}
+"#;
+        let template = TemplateProgram::new(source, Box::new(ElementsJetHinter::new()))
+            .expect("template should parse");
+
+        let compiled = template
+            .compile_function(Some("add_one"), Arguments::default())
+            .expect("compile should succeed");
+
+        let input = Value::u32(41);
+        let output = compiled.execute(input).expect("execute should succeed");
+        assert_eq!(output, Value::u32(42));
+    }
+
+    #[test]
+    fn execute_function_via_template() {
+        use crate::value::ValueConstructible;
+
+        let source = r#"
+fn main() {}
+fn double(x: u32) -> u32 {
+    let (_carry, result): (bool, u32) = jet::add_32(x, x);
+    result
+}
+"#;
+        let template = TemplateProgram::new(source, Box::new(ElementsJetHinter::new()))
+            .expect("template should parse");
+
+        let output = template
+            .execute_function(Some("double"), Arguments::default(), Value::u32(21))
+            .expect("execute_function should succeed");
+        assert_eq!(output, Value::u32(42));
+    }
+
+    #[test]
+    fn execute_function_input_type_mismatch() {
+        use crate::value::ValueConstructible;
+
+        let source = r#"
+fn main() {}
+fn id32(x: u32) -> u32 {
+    x
+}
+"#;
+        let template = TemplateProgram::new(source, Box::new(ElementsJetHinter::new()))
+            .expect("template should parse");
+
+        let compiled = template
+            .compile_function(Some("id32"), Arguments::default())
+            .expect("compile should succeed");
+
+        let bad_input = Value::u8(1);
+        match compiled.execute(bad_input) {
+            Err(ExecuteFunctionError::InputTypeMismatch { .. }) => {}
+            other => panic!("expected InputTypeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_function_rejects_introspection_jet() {
+        use crate::value::ValueConstructible;
+
+        let source = r#"
+fn main() {}
+fn get_num_outputs() -> u32 {
+    jet::num_outputs()
+}
+"#;
+        let template = TemplateProgram::new(source, Box::new(ElementsJetHinter::new()))
+            .expect("template should parse");
+
+        let compiled = template
+            .compile_function(Some("get_num_outputs"), Arguments::default())
+            .expect("compile should succeed");
+
+        match compiled.execute(Value::unit()) {
+            Err(ExecuteFunctionError::ExecutionFailed(msg)) => {
+                assert!(
+                    msg.contains("introspection jet"),
+                    "error message should mention introspection jet, got: {msg}"
+                );
+            }
+            other => panic!("expected ExecutionFailed for introspection jet, got {other:?}"),
         }
     }
 }

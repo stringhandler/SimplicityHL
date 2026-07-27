@@ -112,6 +112,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .value_parser(clap::value_parser!(UnstableFeature))
                     .help(simplicityhl::UnstableFeature::help_message()),
             )
+            .arg(
+                Arg::new("fn")
+                    .long("fn")
+                    .value_name("FUNCTION")
+                    .num_args(0..=1)
+                    .default_missing_value("")
+                    .action(ArgAction::Set)
+                    .help(
+                        "Compile a single function instead of the full program. \
+                         Omit FUNCTION to auto-detect when exactly one function is defined.",
+                    ),
+            )
     };
 
     let matches = command.get_matches();
@@ -197,6 +209,82 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let source = CanonSourceFile::new(main_path.clone(), std::sync::Arc::from(main_text));
+
+    // --fn mode: compile a single function instead of the full program.
+    if matches.contains_id("fn") {
+        let fn_name_arg = matches.get_one::<String>("fn").map(String::as_str);
+        let fn_name = match fn_name_arg {
+            Some("") | None => None,
+            Some(n) => Some(n),
+        };
+
+        let template = match TemplateProgram::new_with_dep(
+            source,
+            &dependencies,
+            &unstable_features,
+            Box::new(ElementsJetHinter::new()),
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        };
+
+        #[cfg(feature = "serde")]
+        let args_opt: simplicityhl::Arguments = match unresolved_args {
+            None => simplicityhl::Arguments::default(),
+            Some(unresolved) => unresolved.resolve(template.parameters())?,
+        };
+        #[cfg(not(feature = "serde"))]
+        let args_opt = simplicityhl::Arguments::default();
+
+        let compiled_fn = match template.compile_function(fn_name, args_opt) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        };
+
+        let source_ty = compiled_fn.source_type();
+        let target_ty = compiled_fn.target_type();
+        let cmr_hex = compiled_fn.cmr().to_string();
+        let bytes_hex: String = compiled_fn
+            .encode()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+
+        if output_json {
+            #[cfg(feature = "serde")]
+            {
+                let params_json: Vec<serde_json::Value> = compiled_fn
+                    .params()
+                    .iter()
+                    .map(|(name, ty)| serde_json::json!({"name": name, "type": ty.to_string()}))
+                    .collect();
+                let obj = serde_json::json!({
+                    "source_type": source_ty.to_string(),
+                    "target_type": target_ty.to_string(),
+                    "params": params_json,
+                    "cmr": cmr_hex,
+                    "program": bytes_hex,
+                });
+                println!("{}", serde_json::to_string_pretty(&obj)?);
+            }
+            #[cfg(not(feature = "serde"))]
+            return Err("JSON output requires the 'serde' feature".into());
+        } else {
+            println!("Source:  {source_ty}");
+            println!("Target:  {target_ty}");
+            println!("CMR:\n{cmr_hex}");
+            println!("Program:\n{bytes_hex}");
+        }
+
+        return Ok(());
+    }
+
     let template = match TemplateProgram::new_with_dep(
         source,
         &dependencies,
