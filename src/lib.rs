@@ -272,14 +272,16 @@ impl TemplateProgram {
         name: Option<&str>,
         arguments: Arguments,
     ) -> Result<CompiledFunction, String> {
+        let available_names = || -> Vec<&str> {
+            self.simfony
+                .named_functions()
+                .keys()
+                .map(String::as_str)
+                .collect()
+        };
         let function = match name {
             Some(n) => self.simfony.named_function(n).ok_or_else(|| {
-                let available: Vec<&str> = self
-                    .simfony
-                    .named_functions()
-                    .keys()
-                    .map(String::as_str)
-                    .collect();
+                let available = available_names();
                 if available.is_empty() {
                     format!("function `{n}` not found; no custom functions are defined")
                 } else {
@@ -295,10 +297,9 @@ impl TemplateProgram {
                     0 => return Err("no custom functions defined in the source".to_string()),
                     1 => fns.values().next().unwrap(),
                     _ => {
-                        let names: Vec<&str> = fns.keys().map(String::as_str).collect();
                         return Err(format!(
                             "multiple functions defined; specify a name: {}",
-                            names.join(", ")
+                            available_names().join(", ")
                         ));
                     }
                 }
@@ -311,12 +312,16 @@ impl TemplateProgram {
             .map(|p| (p.identifier().as_inner().to_string(), p.ty().clone()))
             .collect();
 
-        let source_type = {
-            let mut it = params.iter().rev().map(|(_, ty)| ty.clone());
-            match it.next() {
-                None => ResolvedType::unit(),
-                Some(last) => it.fold(last, |acc, ty| ResolvedType::product(ty, acc)),
-            }
+        // The function's parameters become the Simplicity source type. This must
+        // match how `CustomFunction::params_pattern()` lowers the parameter list:
+        // a single param is that param's type directly, and multiple params form a
+        // tuple (which lowers to a *balanced* product tree via `BTreeSlice`, not a
+        // right-associative fold). See `CompiledFunction::execute`, which relies on
+        // this type matching the compiled combinator's actual source type.
+        let source_type = match params.as_slice() {
+            [] => ResolvedType::unit(),
+            [(_, ty)] => ty.clone(),
+            _ => ResolvedType::tuple(params.iter().map(|(_, ty)| ty.clone())),
         };
 
         let target_type = function.body().ty().clone();
@@ -356,9 +361,10 @@ impl TemplateProgram {
 
 /// A standalone Simplicity combinator compiled from a single SimplicityHL function.
 ///
-/// The combinator's **source** type is the product of the function's parameter
-/// types (right-associative, matching SimplicityHL tuple layout). Its **target**
-/// type is the function's return type.
+/// The combinator's **source** type is the function's parameter list lowered the
+/// same way SimplicityHL lowers a tuple (a single parameter maps to its own type;
+/// multiple parameters form a balanced product tree). Its **target** type is the
+/// function's return type.
 ///
 /// The binary encoding can be passed to a Simplicity bit machine that has the
 /// appropriate input value pre-loaded.
@@ -379,12 +385,12 @@ impl CompiledFunction {
 
     /// The Simplicity source type of the compiled combinator.
     ///
-    /// This is the right-associative product of all parameter types, matching
-    /// SimplicityHL's tuple layout:
+    /// The parameter list is lowered like a SimplicityHL tuple — a balanced
+    /// product tree — so it matches the source type of the compiled combinator:
     /// * 0 params → `()`
     /// * 1 param  → `T`
     /// * 2 params → `T1 × T2`
-    /// * 3 params → `T1 × (T2 × T3)`
+    /// * 4 params → `(T1 × T2) × (T3 × T4)`
     pub fn source_type(&self) -> &ResolvedType {
         &self.source_type
     }
@@ -410,7 +416,7 @@ impl CompiledFunction {
     /// type is `self.target_type()`. Uses a dummy Elements environment — the function
     /// must not reference transaction-introspection jets.
     pub fn execute(&self, input: Value) -> Result<Value, ExecuteFunctionError> {
-        use simplicity::node::{Inner, SimpleFinalizer};
+        use simplicity::node::SimpleFinalizer;
         use simplicity::BitMachine;
 
         if input.ty() != self.source_type() {
@@ -435,23 +441,13 @@ impl CompiledFunction {
                 })
         })?;
 
-        // Scan for introspection jets before executing.
-        use simplicity::dag::DagLike as _;
-        for data in Arc::clone(&commit).post_order_iter::<simplicity::dag::NoSharing>() {
-            if let Inner::Jet(jet) = data.node.inner() {
-                if let Some(el_jet) = jet
-                    .as_ref()
-                    .as_any()
-                    .downcast_ref::<simplicity::jet::Elements>()
-                {
-                    if crate::eval::requires_transaction_context(*el_jet) {
-                        return Err(ExecuteFunctionError::ExecutionFailed(format!(
-                            "function references introspection jet `{el_jet:?}`; \
-                             pure functions must not use transaction-introspection jets"
-                        )));
-                    }
-                }
-            }
+        // Reject introspection jets before executing. This shares the DAG-walk
+        // guard with `eval::eval_expression` (see `eval::introspection_jets_in`).
+        if let Some(name) = crate::eval::introspection_jets_in(&commit).first() {
+            return Err(ExecuteFunctionError::ExecutionFailed(format!(
+                "function references introspection jet `{name}`; \
+                 pure functions must not use transaction-introspection jets"
+            )));
         }
 
         let redeem = commit
@@ -2143,6 +2139,61 @@ fn get_num_outputs() -> u32 {
             }
             other => panic!("expected ExecutionFailed for introspection jet, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn execute_function_two_params() {
+        use crate::value::ValueConstructible;
+
+        let source = r#"
+fn main() {}
+fn add2(a: u32, b: u32) -> u32 {
+    let (_carry, result): (bool, u32) = jet::add_32(a, b);
+    result
+}
+"#;
+        let template = TemplateProgram::new(source, Box::new(ElementsJetHinter::new()))
+            .expect("template should parse");
+        let compiled = template
+            .compile_function(Some("add2"), Arguments::default())
+            .expect("compile should succeed");
+
+        let input = Value::tuple([Value::u32(20), Value::u32(22)]);
+        let output = compiled.execute(input).expect("execute should succeed");
+        assert_eq!(output, Value::u32(42));
+    }
+
+    #[test]
+    fn execute_function_four_params() {
+        use crate::value::ValueConstructible;
+
+        // Regression test for the source-type mismatch that broke execute() for
+        // 4+ parameters: four params lower to the balanced tuple (a×b)×(c×d),
+        // which differs from a right-associative a×(b×(c×d)) fold. With the old
+        // fold, input.ty() != source_type() and execute() rejected valid input.
+        let source = r#"
+fn main() {}
+fn sum4(a: u32, b: u32, c: u32, d: u32) -> u32 {
+    let (_c0, ab): (bool, u32) = jet::add_32(a, b);
+    let (_c1, cd): (bool, u32) = jet::add_32(c, d);
+    let (_c2, abcd): (bool, u32) = jet::add_32(ab, cd);
+    abcd
+}
+"#;
+        let template = TemplateProgram::new(source, Box::new(ElementsJetHinter::new()))
+            .expect("template should parse");
+        let compiled = template
+            .compile_function(Some("sum4"), Arguments::default())
+            .expect("compile should succeed");
+
+        let input = Value::tuple([
+            Value::u32(10),
+            Value::u32(11),
+            Value::u32(12),
+            Value::u32(9),
+        ]);
+        let output = compiled.execute(input).expect("execute should succeed");
+        assert_eq!(output, Value::u32(42));
     }
 }
 

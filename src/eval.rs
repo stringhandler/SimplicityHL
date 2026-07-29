@@ -9,8 +9,10 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use simplicity::jet::Elements;
+use simplicity::CommitNode;
 
 use crate::ast::ElementsJetHinter;
 use crate::dummy_env;
@@ -56,9 +58,13 @@ impl std::error::Error for EvalError {}
 /// Returns `true` if the given Elements jet reads from the transaction environment
 /// (i.e., requires a real [`ElementsEnv`](simplicity::jet::elements::ElementsEnv)).
 ///
-/// **Maintenance**: this is a positive allowlist. When the `simplicity` crate
-/// adds new Elements jets, audit the new variants and add any that access
-/// transaction state to the `matches!` below.
+/// **Maintenance**: this is a positive allowlist, so a jet that is *not* listed
+/// is treated as pure and will be executed against the dummy environment. That
+/// is a fail-open default: a new upstream introspection jet would silently return
+/// bogus data. The `introspection_allowlist_is_pinned_to_jet_set` test guards
+/// against this by pinning the total jet count — when the `simplicity` crate
+/// changes its jet set, that test fails so the new variants get audited and any
+/// transaction-reading ones added below.
 pub fn requires_transaction_context(jet: Elements) -> bool {
     use Elements::*;
     matches!(
@@ -209,26 +215,38 @@ fn strip_comments(s: &str) -> String {
     result
 }
 
-/// Scan `expr` for `jet::name(...)` patterns and return the name and parsed
-/// jet for each occurrence. The caller must have already stripped comments
-/// from `expr`; see [`eval_expression`] which does this before calling here.
-fn scan_jets(expr: &str) -> Vec<(String, Elements)> {
-    let mut jets = Vec::new();
-    let mut remaining = expr;
+/// Whether `c` can appear inside an identifier (alphanumeric or `_`).
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
 
-    while let Some(pos) = remaining.find("jet::") {
-        remaining = &remaining[pos + 5..];
-        let end = remaining
-            .find(|c: char| !c.is_alphanumeric() && c != '_')
-            .unwrap_or(remaining.len());
-        let name = &remaining[..end];
-        if let Ok(jet) = Elements::from_str(name) {
-            jets.push((name.to_string(), jet));
+/// Collect the names of Elements introspection jets referenced by a compiled
+/// node.
+///
+/// This walks the node's DAG — the robust, structural check — rather than
+/// scanning source text, so jets reached through `let` bindings, tuples, or
+/// comments are still caught. Both [`eval_expression`] and
+/// [`CompiledFunction::execute`](crate::CompiledFunction::execute) use it to
+/// reject work that needs a live transaction context before running it against
+/// the dummy environment.
+pub(crate) fn introspection_jets_in(commit: &Arc<CommitNode>) -> Vec<String> {
+    use simplicity::dag::DagLike as _;
+    use simplicity::node::Inner;
+
+    let mut found: Vec<String> = Vec::new();
+    for data in Arc::clone(commit).post_order_iter::<simplicity::dag::NoSharing>() {
+        if let Inner::Jet(jet) = data.node.inner() {
+            if let Some(el) = jet.as_ref().as_any().downcast_ref::<Elements>() {
+                if requires_transaction_context(*el) {
+                    let name = el.to_string();
+                    if !found.contains(&name) {
+                        found.push(name);
+                    }
+                }
+            }
         }
-        remaining = &remaining[end..];
     }
-
-    jets
+    found
 }
 
 /// Attempt to infer the SimplicityHL return type string by inspecting the
@@ -238,7 +256,7 @@ fn infer_return_type(expr: &str) -> Option<String> {
     let trimmed = expr.trim();
     let rest = trimmed.strip_prefix("jet::")?;
     let end = rest
-        .find(|c: char| !c.is_alphanumeric() && c != '_')
+        .find(|c: char| !is_ident_char(c))
         .unwrap_or(rest.len());
     let name = &rest[..end];
     let jet = Elements::from_str(name).ok()?;
@@ -261,13 +279,11 @@ fn replace_identifier(s: &str, key: &str, replacement: &str) -> String {
             let before_ok = result
                 .chars()
                 .last()
-                .map(|c| !c.is_alphanumeric() && c != '_')
-                .unwrap_or(true);
+                .map_or(true, |c| !is_ident_char(c));
             let after_ok = remaining[key.len()..]
                 .chars()
                 .next()
-                .map(|c| !c.is_alphanumeric() && c != '_')
-                .unwrap_or(true);
+                .map_or(true, |c| !is_ident_char(c));
 
             if before_ok && after_ok {
                 result.push_str(replacement);
@@ -308,36 +324,38 @@ fn replace_identifier(s: &str, key: &str, replacement: &str) -> String {
 ///   the outermost expression is not a direct jet call, or execution failed.
 /// * [`EvalError::NoResult`] — the expression executed but fired no jets, so no
 ///   result was captured (e.g. the expression contains no jet calls).
-pub fn eval_expression(
+pub fn eval_expression<S: std::hash::BuildHasher>(
     source: &str,
-    bindings: &HashMap<String, Value>,
+    bindings: &HashMap<String, Value, S>,
 ) -> Result<Value, EvalError> {
-    // Strip comments before any further processing so that jet names inside
-    // comments don't trigger false-positive rejections, and so that comments
-    // embedded in `source` don't corrupt the synthetic program we build below.
+    // Strip comments so that comments embedded in `source` don't corrupt the
+    // synthetic program we build below. The introspection-jet guard runs on the
+    // compiled DAG further down, so jets hidden in comments are naturally ignored
+    // by the compiler rather than by this textual pass.
     let source_stripped = strip_comments(source);
     let source = source_stripped.as_str();
-
-    // Early-exit if any jet in the expression requires transaction context.
-    let introspection_jets: Vec<String> = scan_jets(source)
-        .into_iter()
-        .filter(|(_, jet)| requires_transaction_context(*jet))
-        .map(|(name, _)| name)
-        .collect();
-
-    if !introspection_jets.is_empty() {
-        return Err(EvalError::RequiresTransactionContext(introspection_jets));
-    }
 
     // Build sanitised parameter names. Sort keys by length (longest first) so
     // that longer keys are replaced before shorter keys that might be substrings.
     let mut sorted_keys: Vec<&str> = bindings.keys().map(String::as_str).collect();
-    sorted_keys.sort_by(|a, b| b.len().cmp(&a.len()));
+    sorted_keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
 
-    let sanitized: HashMap<&str, String> = sorted_keys
-        .iter()
-        .map(|&k| (k, sanitize_key(k)))
-        .collect();
+    // Reject collisions where two distinct keys sanitise to the same param name
+    // (e.g. `"a.b"` and `"a-b"` both -> `EB_A_B`). Without this check one binding
+    // would be silently dropped and the wrong value used for both occurrences.
+    let mut sanitized: HashMap<&str, String> = HashMap::with_capacity(sorted_keys.len());
+    let mut by_name: HashMap<String, &str> = HashMap::with_capacity(sorted_keys.len());
+    for &key in &sorted_keys {
+        let name = sanitize_key(key);
+        if let Some(&other) = by_name.get(&name) {
+            return Err(EvalError::CompilationError(format!(
+                "binding keys `{other}` and `{key}` both map to the parameter name \
+                 `{name}`; rename one to avoid the collision"
+            )));
+        }
+        by_name.insert(name.clone(), key);
+        sanitized.insert(key, name);
+    }
 
     // Replace each free-variable occurrence in the source with `param::SANITIZED`.
     // Use word-boundary-aware replacement so a short key like "c" doesn't corrupt
@@ -381,6 +399,13 @@ pub fn eval_expression(
     let compiled = template
         .instantiate(arguments, false)
         .map_err(EvalError::CompilationError)?;
+
+    // Reject expressions that need a live transaction context, walking the
+    // compiled DAG rather than the source text (matches CompiledFunction::execute).
+    let introspection = introspection_jets_in(&compiled.commit());
+    if !introspection.is_empty() {
+        return Err(EvalError::RequiresTransactionContext(introspection));
+    }
 
     let satisfied = compiled
         .satisfy(WitnessValues::default())
@@ -438,6 +463,24 @@ mod tests {
         Value::u256(U256::from_byte_array(bytes))
     }
 
+    /// Number of Elements jets `requires_transaction_context` was audited against.
+    /// Bump this only after reviewing added/removed jets and updating the
+    /// allowlist. See the pin test below for why.
+    const EXPECTED_ELEMENTS_JET_COUNT: usize = 471;
+
+    #[test]
+    fn introspection_allowlist_is_pinned_to_jet_set() {
+        // `requires_transaction_context` is a fail-open allowlist. Pin the jet
+        // set so a change upstream fails loudly instead of silently letting a new
+        // introspection jet run against the dummy environment.
+        assert_eq!(
+            Elements::ALL.len(),
+            EXPECTED_ELEMENTS_JET_COUNT,
+            "Elements jet set changed; audit new jets, update \
+             requires_transaction_context, then set EXPECTED_ELEMENTS_JET_COUNT"
+        );
+    }
+
     #[test]
     fn test_introspection_jet_rejected() {
         let bindings = HashMap::new();
@@ -472,6 +515,24 @@ mod tests {
             &bindings,
         );
         assert!(result2.is_ok(), "introspection jet in block comment should not be rejected: {result2:?}");
+    }
+
+    #[test]
+    fn test_sanitize_key_collision_rejected() {
+        // `"a.b"` and `"a-b"` both sanitise to `EB_A_B`. This must be rejected,
+        // not silently collapsed into one binding.
+        let mut bindings = HashMap::new();
+        bindings.insert("a.b".to_string(), make_u32(1));
+        bindings.insert("a-b".to_string(), make_u32(2));
+        match eval_expression("jet::calculate_asset(a.b)", &bindings) {
+            Err(EvalError::CompilationError(msg)) => {
+                assert!(
+                    msg.contains("map to the parameter name"),
+                    "expected a collision error, got: {msg}"
+                );
+            }
+            other => panic!("expected CompilationError for key collision, got {other:?}"),
+        }
     }
 
     #[test]

@@ -118,10 +118,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .value_name("FUNCTION")
                     .num_args(0..=1)
                     .default_missing_value("")
+                    // Require `--fn=NAME` for the value form so a following
+                    // positional (the program file) is never consumed as the
+                    // function name; bare `--fn` auto-detects.
+                    .require_equals(true)
                     .action(ArgAction::Set)
                     .help(
                         "Compile a single function instead of the full program. \
-                         Omit FUNCTION to auto-detect when exactly one function is defined.",
+                         Pass --fn=FUNCTION to select one by name, or bare --fn to \
+                         auto-detect when exactly one function is defined.",
                     ),
             )
     };
@@ -212,11 +217,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --fn mode: compile a single function instead of the full program.
     if matches.contains_id("fn") {
-        let fn_name_arg = matches.get_one::<String>("fn").map(String::as_str);
-        let fn_name = match fn_name_arg {
-            Some("") | None => None,
-            Some(n) => Some(n),
-        };
+        let fn_name = matches
+            .get_one::<String>("fn")
+            .map(String::as_str)
+            .filter(|s| !s.is_empty());
 
         let template = match TemplateProgram::new_with_dep(
             source,
