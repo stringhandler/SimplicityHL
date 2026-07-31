@@ -78,10 +78,8 @@ impl<'brand> Scope<'brand> {
     ///
     /// _This function should be called at the start of the compilation and then never again._
     ///
-    ///  ## Precondition
-    ///
-    /// The supplied `arguments` are consistent with the program's parameters.
-    /// Call [`Arguments::is_consistent`] before calling this method!
+    /// The supplied `arguments` need not be consistent with the program's parameters:
+    /// each `param::` reference is checked as it is compiled.
     pub fn new(
         ctx: simplicity::types::Context<'brand>,
         call_tracker: Arc<CallTracker>,
@@ -239,10 +237,11 @@ impl<'brand> Scope<'brand> {
         }
     }
 
-    pub fn get_argument(&self, name: &WitnessName) -> &Value {
-        self.arguments
-            .get(name)
-            .expect("Precondition: Arguments are consistent with parameters")
+    /// Look up the argument supplied for the parameter `name`.
+    ///
+    /// Returns `None` if the caller supplied no argument for this parameter.
+    pub fn get_argument(&self, name: &WitnessName) -> Option<&Value> {
+        self.arguments.get(name)
     }
 }
 
@@ -279,10 +278,14 @@ fn compile_blk<'brand>(
 impl Program {
     /// Compile the SimplicityHL source code to Simplicity target code.
     ///
-    /// ## Precondition
+    /// ## Errors
     ///
-    /// The supplied `arguments` are consistent with the program's parameters.
-    /// Call [`Arguments::is_consistent`] before calling this method!
+    /// * [`Error::ArgumentMissing`] A `param::` reference has no argument.
+    /// * [`Error::ArgumentTypeMismatch`] An argument's type differs from the parameter's.
+    ///
+    /// Both are reported lazily, at the first offending reference reached during
+    /// compilation. Prefer [`Arguments::is_consistent`] beforehand: it reports every
+    /// inconsistency at once, including for parameters this compilation never reaches.
     pub fn compile(
         &self,
         arguments: Arguments,
@@ -313,10 +316,15 @@ impl Program {
     /// can be encoded as binary and called by a Simplicity bit machine that has
     /// the appropriate input pre-loaded.
     ///
-    /// ## Precondition
+    /// ## Errors
     ///
-    /// The supplied `arguments` are consistent with the `param::` names referenced
-    /// in the function body.
+    /// * [`Error::ArgumentMissing`] A `param::` reference has no argument.
+    /// * [`Error::ArgumentTypeMismatch`] An argument's type differs from the parameter's.
+    ///
+    /// Only the `param::` names reached while compiling this function's body are
+    /// checked. [`Arguments::is_consistent`] is stricter: it demands an argument for
+    /// every parameter in the whole program, including those belonging to functions
+    /// that are not being compiled here.
     pub fn compile_function(
         &self,
         function: &CustomFunction,
@@ -371,7 +379,25 @@ impl SingleExpression {
             }
             SingleExpressionInner::Witness(name) => PairBuilder::witness(scope.ctx(), name.clone()),
             SingleExpressionInner::Parameter(name) => {
-                let value = StructuralValue::from(scope.get_argument(name));
+                let argument = scope
+                    .get_argument(name)
+                    .ok_or(Error::ArgumentMissing {
+                        name: name.shallow_clone(),
+                    })
+                    .with_span(self)?;
+                // The unification below only compares structural types, and those are lossy:
+                // `u32`, `[u8; 4]` and `(u16, u16)` all lower to the same Simplicity type.
+                // Compare the resolved types here, or a mistyped argument would be scribed
+                // into the program without complaint.
+                if !argument.is_of_type(self.ty()) {
+                    return Err(Error::ArgumentTypeMismatch {
+                        name: name.shallow_clone(),
+                        declared: self.ty().clone(),
+                        assigned: argument.ty().clone(),
+                    })
+                    .with_span(self);
+                }
+                let value = StructuralValue::from(argument);
                 PairBuilder::unit_scribe(scope.ctx(), value.as_ref())
             }
             SingleExpressionInner::Variable(identifier) => scope
@@ -814,5 +840,74 @@ impl EnumMatch {
         let scrutinee = self.scrutinee().compile(scope)?;
         let input = scrutinee.pair(PairBuilder::iden(scope.ctx()));
         input.comp(&dispatch).with_span(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use crate::ast::ElementsJetHinter;
+    use crate::str::WitnessName;
+    use crate::value::{UIntValue, ValueConstructible as _};
+    use crate::witness::Arguments;
+    use crate::{TemplateProgram, Value};
+
+    /// The context `jet::eq_32` gives `param::FOO` the resolved type `u32`.
+    const SOURCE: &str = r#"fn main() {
+    assert!(jet::eq_32(param::FOO, 42));
+}"#;
+
+    /// Compile `SOURCE` directly, bypassing [`TemplateProgram::instantiate`] so that
+    /// `Arguments::is_consistent` does not screen the arguments first.
+    fn compile_with(arguments: Arguments) -> Result<(), String> {
+        let template = TemplateProgram::new(SOURCE, Box::new(ElementsJetHinter::new())).unwrap();
+        template
+            .simfony
+            .compile(arguments, false, Box::new(ElementsJetHinter::new()))
+            .map(|_| ())
+            .map_err(|diagnostic| diagnostic.to_string())
+    }
+
+    fn foo(value: Value) -> Arguments {
+        let mut map = HashMap::new();
+        map.insert(WitnessName::from_str_unchecked("FOO"), value);
+        Arguments::from(map)
+    }
+
+    #[test]
+    fn correctly_typed_argument_compiles() {
+        compile_with(foo(Value::from(UIntValue::from(42u32)))).unwrap();
+    }
+
+    #[test]
+    fn missing_argument_is_an_error_not_a_panic() {
+        let error = compile_with(Arguments::default()).unwrap_err();
+        assert!(
+            error.contains("FOO") && error.contains("missing an argument"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn argument_of_wrong_type_is_rejected() {
+        let error = compile_with(foo(Value::from(true))).unwrap_err();
+        assert!(
+            error.contains("FOO") && error.contains("bool"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn argument_whose_structural_type_collides_is_rejected() {
+        // `[u8; 4]` and `u32` lower to the same Simplicity type, so the unification at
+        // the end of `SingleExpression::compile` accepts this pair. Without the resolved
+        // type comparison in the `Parameter` arm, this would compile without complaint
+        // and commit to a program the caller did not ask for.
+        let error = compile_with(foo(Value::byte_array([0u8, 0, 0, 42]))).unwrap_err();
+        assert!(
+            error.contains("FOO") && error.contains("u8"),
+            "unexpected error: {error}"
+        );
     }
 }

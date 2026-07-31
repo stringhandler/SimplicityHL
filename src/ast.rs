@@ -64,7 +64,7 @@ impl Program {
         &self.call_tracker
     }
 
-    /// Access all named custom functions defined in the main source file.
+    /// Access all named custom functions defined in the entrypoint source file.
     pub fn named_functions(&self) -> &HashMap<String, CustomFunction> {
         &self.named_functions
     }
@@ -1157,16 +1157,9 @@ impl Scope {
         }
     }
 
-    /// Return a map of all custom functions defined in the main source file,
-    /// keyed by their plain string names (excluding `main`).
+    /// Return the entrypoint file's functions, keyed by name, excluding `main`.
     ///
-    /// Only functions whose definition appears in the root `.simf` file are
-    /// included. Functions imported from dependency files have a different
-    /// `file_id` and are intentionally excluded — callers that need a function
-    /// from an imported library must compile it via that library's own
-    /// `TemplateProgram`.
-    ///
-    /// Must be called before [`Self::destruct`].
+    /// Imported functions are excluded.
     pub fn collect_named_functions(&self) -> HashMap<String, CustomFunction> {
         self.root
             .functions
